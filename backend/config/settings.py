@@ -71,6 +71,12 @@ IMPORT_PREVIEW_STORAGE_DIR = Path(
     os.getenv("IMPORT_PREVIEW_STORAGE_DIR", str(BASE_DIR / "private_storage" / "import_previews"))
 )
 IMPORT_PREVIEW_TTL_SECONDS = 2 * 60 * 60
+DIRECT_RECONCILIATION_STORAGE_DIR = Path(
+    os.getenv(
+        "DIRECT_RECONCILIATION_STORAGE_DIR",
+        str(BASE_DIR / "private_storage" / "direct_reconciliation"),
+    )
+)
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [

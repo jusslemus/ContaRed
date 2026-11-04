@@ -16,6 +16,27 @@ class DatabaseUnavailable(APIException):
     default_code = "database_unavailable"
 
 
+def database_error_details(exc: DatabaseError) -> str:
+    cause = exc.__cause__ or exc
+    sqlstate = getattr(cause, "sqlstate", None) or getattr(cause, "pgcode", None)
+    diagnostic = getattr(cause, "diag", None)
+    details = [
+        f"error_type={type(exc).__name__}",
+        f"SQLSTATE: {sqlstate or 'unavailable'}",
+    ]
+    for label, attribute in (
+        ("schema", "schema_name"),
+        ("table", "table_name"),
+        ("column", "column_name"),
+        ("constraint", "constraint_name"),
+        ("message", "message_primary"),
+    ):
+        value = getattr(diagnostic, attribute, None) if diagnostic else None
+        if value:
+            details.append(f"{label}={value}")
+    return ", ".join(details)
+
+
 def load_session_access(auth_user_id: UUID) -> dict:
     try:
         with transaction.atomic():
@@ -76,8 +97,8 @@ def load_session_access(auth_user_id: UUID) -> dict:
 
     except DatabaseError as exc:
         logger.error(
-            "ContaRed session lookup failed (database error type: %s).",
-            type(exc).__name__,
+            "ContaRed session lookup failed (%s).",
+            database_error_details(exc),
         )
         raise DatabaseUnavailable() from exc
 
@@ -129,7 +150,9 @@ def resolve_authorized_scope(auth_user_id: UUID, company_id: str, country_code: 
 
     return {
         "user_id": session["usuario"]["id"],
+        "user_name": session["usuario"]["nombre"],
         "company_id": company_id,
+        "company_name": access["empresa"],
         "country_code": country_code,
         "role": access["rol"],
     }

@@ -1,6 +1,6 @@
 import logoUrl from "../../../backend/img/logo.jpg";
 
-export type Section = "Inicio" | "Cuentas" | "Conciliaciones" | "Pendientes";
+export type Section = "Nueva conciliación" | "Historial" | "Cuentas";
 
 interface Props {
   active: Section;
@@ -13,10 +13,8 @@ interface Props {
 
 export default function NavigationSidebar({ active, userName, role, mobileOpen, onChange, onCloseMobile }: Props) {
   const items: { label: Section; available: boolean }[] = [
-    { label: "Inicio", available: true },
     { label: "Cuentas", available: true },
-    { label: "Conciliaciones", available: true },
-    { label: "Pendientes", available: false },
+    { label: "Nueva conciliación", available: true },
   ];
   return (
     <>
