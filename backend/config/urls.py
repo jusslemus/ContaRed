@@ -3,12 +3,44 @@ from django.urls import path
 from contared_api.banking import (
     AccountDetailView,
     AccountListCreateView,
+    CatalogAccountRetirementView,
     BankDetailView,
     BankListCreateView,
     CurrencyListView,
 )
+from contared_api.comparison import (
+    ReconciliationComparisonView,
+    ReconciliationProposalConfirmView,
+    ReconciliationProposalDismissView,
+)
+from contared_api.comparison_reports import ReconciliationReportView
+from contared_api.conciliacion_eliminacion import (
+    ReconciliationDeletionPendingView,
+    ReconciliationDeletionView,
+)
+from contared_api.depositos import (
+    DepositCaseActionView,
+    DepositHistoryView,
+    DepositSupportView,
+    ReconciliationDepositView,
+)
+from contared_api.cheques import (
+    ChequeAnnulmentView,
+    ChequeCandidatesView,
+    ChequeCashView,
+    ChequeDeliveryView,
+    ChequeHistoryView,
+    ChequeImportDetailView,
+    ChequeImportTemplateView,
+    ChequeImportsView,
+    ChequeIssuanceCandidatesView,
+    ChequeSupportView,
+    ManualChequeCreateView,
+    ReconciliationChequesView,
+)
 from contared_api.conciliaciones import (
     ReconciliationAccountListView,
+    ReconciliationArchiveView,
     ReconciliationDetailView,
     ReconciliationImportProfileListView,
     ReconciliationListCreateView,
@@ -17,21 +49,63 @@ from contared_api.conciliaciones import (
     ReconciliationPreviewCreateView,
     ReconciliationPreviewInspectView,
     ReconciliationPreviewValidateView,
+    UnboundReconciliationPreviewCreateView,
+    UnboundReconciliationPreviewDeleteView,
+    UnboundReconciliationPreviewInspectView,
+    UnboundReconciliationPreviewValidateView,
 )
 from contared_api.views import ApiStatusView, SessionView
+from contared_api.reconciliation_summary import ReconciliationSummaryView
+from contared_api.direct_reconciliation import (
+    DirectReconciliationDetailView,
+    DirectReconciliationListCreateView,
+    DirectReconciliationReportView,
+)
 
 urlpatterns = [
     path("api/v1/status/", ApiStatusView.as_view(), name="api-status"),
     path("api/v1/session/", SessionView.as_view(), name="api-session"),
+    path("api/v1/conciliaciones-directas/trabajos/", DirectReconciliationListCreateView.as_view(), name="api-direct-reconciliation-list-create"),
+    path("api/v1/conciliaciones-directas/trabajos/<uuid:job_id>/", DirectReconciliationDetailView.as_view(), name="api-direct-reconciliation-detail"),
+    path("api/v1/conciliaciones-directas/trabajos/<uuid:job_id>/reporte/", DirectReconciliationReportView.as_view(), name="api-direct-reconciliation-report"),
     path("api/v1/bancos/", BankListCreateView.as_view(), name="api-banks"),
     path("api/v1/bancos/<uuid:bank_id>/", BankDetailView.as_view(), name="api-bank-detail"),
     path("api/v1/cuentas/", AccountListCreateView.as_view(), name="api-accounts"),
+    path("api/v1/catalogo-cuentas/<uuid:catalog_id>/retiro/", CatalogAccountRetirementView.as_view(), name="api-catalog-account-retirement"),
     path("api/v1/cuentas/<uuid:account_id>/", AccountDetailView.as_view(), name="api-account-detail"),
+    path("api/v1/cuentas/<uuid:account_id>/cheques/plantilla/", ChequeImportTemplateView.as_view(), name="api-cheque-import-template"),
+    path("api/v1/cuentas/<uuid:account_id>/cheques/importaciones/", ChequeImportsView.as_view(), name="api-cheque-imports"),
+    path("api/v1/cuentas/<uuid:account_id>/cheques/importaciones/<uuid:import_id>/", ChequeImportDetailView.as_view(), name="api-cheque-import-detail"),
     path("api/v1/monedas/", CurrencyListView.as_view(), name="api-currencies"),
     path("api/v1/conciliaciones/cuentas/", ReconciliationAccountListView.as_view(), name="api-reconciliation-accounts"),
+    path("api/v1/conciliaciones/previsualizaciones/", UnboundReconciliationPreviewCreateView.as_view(), name="api-reconciliation-unbound-preview"),
+    path("api/v1/conciliaciones/previsualizaciones/<uuid:preview_id>/", UnboundReconciliationPreviewDeleteView.as_view(), name="api-reconciliation-unbound-preview-delete"),
+    path("api/v1/conciliaciones/previsualizaciones/<uuid:preview_id>/inspeccionar/", UnboundReconciliationPreviewInspectView.as_view(), name="api-reconciliation-unbound-preview-inspect"),
+    path("api/v1/conciliaciones/previsualizaciones/<uuid:preview_id>/validar/", UnboundReconciliationPreviewValidateView.as_view(), name="api-reconciliation-unbound-preview-validate"),
     path("api/v1/conciliaciones/", ReconciliationListCreateView.as_view(), name="api-reconciliations"),
+    path("api/v1/conciliaciones/eliminacion-archivos-pendientes/", ReconciliationDeletionPendingView.as_view(), name="api-reconciliation-deletion-pending"),
     path("api/v1/conciliaciones/<uuid:reconciliation_id>/", ReconciliationDetailView.as_view(), name="api-reconciliation-detail"),
+    path("api/v1/conciliaciones/<uuid:reconciliation_id>/eliminacion/", ReconciliationDeletionView.as_view(), name="api-reconciliation-deletion"),
+    path("api/v1/conciliaciones/<uuid:reconciliation_id>/archivo/", ReconciliationArchiveView.as_view(), name="api-reconciliation-archive"),
+    path("api/v1/conciliaciones/<uuid:reconciliation_id>/resumen/", ReconciliationSummaryView.as_view(), name="api-reconciliation-summary"),
     path("api/v1/conciliaciones/<uuid:reconciliation_id>/movimientos/", ReconciliationMovementsView.as_view(), name="api-reconciliation-movements"),
+    path("api/v1/conciliaciones/<uuid:reconciliation_id>/comparaciones/", ReconciliationComparisonView.as_view(), name="api-reconciliation-comparisons"),
+    path("api/v1/conciliaciones/<uuid:reconciliation_id>/comparaciones/reportes/", ReconciliationReportView.as_view(), name="api-reconciliation-comparison-report"),
+    path("api/v1/conciliaciones/<uuid:reconciliation_id>/comparaciones/propuestas/<uuid:proposal_id>/confirmar/", ReconciliationProposalConfirmView.as_view(), name="api-reconciliation-proposal-confirm"),
+    path("api/v1/conciliaciones/<uuid:reconciliation_id>/comparaciones/propuestas/<uuid:proposal_id>/descartar/", ReconciliationProposalDismissView.as_view(), name="api-reconciliation-proposal-dismiss"),
+    path("api/v1/conciliaciones/<uuid:reconciliation_id>/depositos/", ReconciliationDepositView.as_view(), name="api-reconciliation-deposits"),
+    path("api/v1/conciliaciones/<uuid:reconciliation_id>/depositos/<uuid:case_id>/", DepositCaseActionView.as_view(), name="api-deposit-case-action"),
+    path("api/v1/conciliaciones/<uuid:reconciliation_id>/depositos/<uuid:case_id>/historial/", DepositHistoryView.as_view(), name="api-deposit-history"),
+    path("api/v1/conciliaciones/<uuid:reconciliation_id>/depositos/<uuid:case_id>/soporte/", DepositSupportView.as_view(), name="api-deposit-support"),
+    path("api/v1/conciliaciones/<uuid:reconciliation_id>/cheques/", ReconciliationChequesView.as_view(), name="api-reconciliation-cheques"),
+    path("api/v1/conciliaciones/<uuid:reconciliation_id>/cheques/movimientos-emision/", ChequeIssuanceCandidatesView.as_view(), name="api-cheque-issuance-candidates"),
+    path("api/v1/conciliaciones/<uuid:reconciliation_id>/cheques/manuales/", ManualChequeCreateView.as_view(), name="api-manual-cheque-create"),
+    path("api/v1/conciliaciones/<uuid:reconciliation_id>/cheques/<uuid:cheque_id>/entrega/", ChequeDeliveryView.as_view(), name="api-cheque-delivery"),
+    path("api/v1/conciliaciones/<uuid:reconciliation_id>/cheques/<uuid:cheque_id>/cobros-candidatos/", ChequeCandidatesView.as_view(), name="api-cheque-candidates"),
+    path("api/v1/conciliaciones/<uuid:reconciliation_id>/cheques/<uuid:cheque_id>/cobrar/", ChequeCashView.as_view(), name="api-cheque-cash"),
+    path("api/v1/conciliaciones/<uuid:reconciliation_id>/cheques/<uuid:cheque_id>/anular/", ChequeAnnulmentView.as_view(), name="api-cheque-annul"),
+    path("api/v1/conciliaciones/<uuid:reconciliation_id>/cheques/<uuid:cheque_id>/historial/", ChequeHistoryView.as_view(), name="api-cheque-history"),
+    path("api/v1/conciliaciones/<uuid:reconciliation_id>/cheques/<uuid:cheque_id>/soportes/<uuid:event_id>/", ChequeSupportView.as_view(), name="api-cheque-support"),
     path("api/v1/conciliaciones/<uuid:reconciliation_id>/perfiles/", ReconciliationImportProfileListView.as_view(), name="api-reconciliation-profiles"),
     path("api/v1/conciliaciones/<uuid:reconciliation_id>/previsualizaciones/", ReconciliationPreviewCreateView.as_view(), name="api-reconciliation-preview"),
     path("api/v1/conciliaciones/<uuid:reconciliation_id>/previsualizaciones/<uuid:preview_id>/inspeccionar/", ReconciliationPreviewInspectView.as_view(), name="api-reconciliation-preview-inspect"),

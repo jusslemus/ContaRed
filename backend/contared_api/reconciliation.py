@@ -1,4 +1,4 @@
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
@@ -16,6 +16,8 @@ Rule = Literal[
     "unmatched",
 ]
 MAX_GROUP_SIZE = 3
+MAX_GROUP_CANDIDATES = 2500
+MAX_PAIR_COMPARISONS = 25000
 
 
 @dataclass(frozen=True)
@@ -56,235 +58,243 @@ def propose_reconciliation(
         raise ValueError("Los montos deben ser valores Decimal finitos.")
 
     proposals: list[Proposal] = []
-    matched_bank: set[str] = set()
-    matched_books: set[str] = set()
-    annotated_bank: set[str] = set()
-    annotated_books: set[str] = set()
-    reference_matches = _unique_pairs(
-        bank_movements,
-        book_movements,
+    claimed_bank: set[str] = set()
+    claimed_books: set[str] = set()
+
+    def consume_pairs(rule: Rule, predicate, explanation, candidate_key) -> None:
+        available_bank = [item for item in bank_movements if item.id not in claimed_bank]
+        available_books = [item for item in book_movements if item.id not in claimed_books]
+        for banks, books in _pair_components(
+            available_bank, available_books, predicate, candidate_key
+        ):
+            claimed_bank.update(item.id for item in banks)
+            claimed_books.update(item.id for item in books)
+            if len(banks) == len(books) == 1:
+                bank, book = banks[0], books[0]
+                proposals.append(
+                    Proposal(rule, (bank.id,), (book.id,), explanation(bank, book))
+                )
+            else:
+                proposals.append(
+                    Proposal(
+                        "ambiguous",
+                        tuple(item.id for item in banks),
+                        tuple(item.id for item in books),
+                        "Hay varios candidatos compatibles; requiere revisión manual.",
+                    )
+                )
+
+    consume_pairs(
+        "reference_amount",
         lambda bank, book: bool(bank.reference)
         and bank.reference == book.reference
         and bank.amount == book.amount,
+        lambda bank, book: (
+            "Referencia y monto exactos. "
+            f"Revisar fechas: banco {bank.transaction_date.isoformat()}, "
+            f"libros {book.transaction_date.isoformat()}."
+        ),
+        lambda movement: (movement.reference, movement.amount)
+        if movement.reference
+        else None,
     )
-    for bank, book in reference_matches:
+    consume_pairs(
+        "amount_date",
+        lambda bank, book: bank.amount == book.amount
+        and bank.transaction_date == book.transaction_date,
+        lambda bank, book: (
+            "Fecha y monto exactos; la referencia difiere o no está informada "
+            f"(banco {bank.transaction_date.isoformat()}, "
+            f"libros {book.transaction_date.isoformat()}). "
+            "El candidato es único en ambos lados."
+        ),
+        lambda movement: (movement.transaction_date, movement.amount),
+    )
+
+    remaining_bank = [item for item in bank_movements if item.id not in claimed_bank]
+    remaining_books = [item for item in book_movements if item.id not in claimed_books]
+    for (bank_ids, book_ids), ambiguous in _group_components(
+        remaining_bank, remaining_books
+    ):
+        claimed_bank.update(bank_ids)
+        claimed_books.update(book_ids)
         proposals.append(
             Proposal(
-                "reference_amount",
-                (bank.id,),
-                (book.id,),
-                "Referencia y monto exactos.",
+                "ambiguous" if ambiguous else "reference_date_group",
+                bank_ids,
+                book_ids,
+                (
+                    "Hay varias agrupaciones posibles por referencia, fecha y monto; "
+                    "requiere revisión manual."
+                    if ambiguous
+                    else f"Referencia y fecha exactas; agrupación limitada a {MAX_GROUP_SIZE} partidas."
+                ),
             )
         )
-        matched_bank.add(bank.id)
-        matched_books.add(book.id)
 
-    for side_movements, opposite_movements, side_name in (
-        (bank_movements, book_movements, "bank"),
-        (book_movements, bank_movements, "books"),
-    ):
-        for movement in side_movements:
-            if movement.id in (matched_bank if side_name == "bank" else matched_books):
-                continue
-            candidates = [
-                other
-                for other in opposite_movements
-                if other.id
-                not in (matched_books if side_name == "bank" else matched_bank)
-                and other.amount == movement.amount
-                and other.transaction_date == movement.transaction_date
-            ]
-            if len(candidates) > 1:
-                _append_ambiguity(
-                    proposals,
-                    movement,
-                    candidates,
-                    side_name,
-                    "Hay varios candidatos con el mismo monto y fecha.",
-                )
-                (annotated_bank if side_name == "bank" else annotated_books).add(
-                    movement.id
-                )
-            elif len(candidates) == 1:
-                other = candidates[0]
-                reverse_candidates = [
-                    candidate
-                    for candidate in side_movements
-                    if candidate.id
-                    not in (
-                        matched_bank if side_name == "bank" else matched_books
-                    )
-                    and candidate.amount == other.amount
-                    and candidate.transaction_date == other.transaction_date
-                ]
-                if len(reverse_candidates) == 1:
-                    bank, book = (
-                        (movement, other) if side_name == "bank" else (other, movement)
-                    )
-                    proposals.append(
-                        Proposal(
-                            "amount_date",
-                            (bank.id,),
-                            (book.id,),
-                            "Monto y fecha exactos; el candidato es único en ambos lados.",
-                        )
-                    )
-                    matched_bank.add(bank.id)
-                    matched_books.add(book.id)
-                else:
-                    _append_ambiguity(
-                        proposals,
-                        movement,
-                        reverse_candidates,
-                        side_name,
-                        "El candidato comparte monto y fecha con varios movimientos.",
-                    )
-                    (annotated_bank if side_name == "bank" else annotated_books).add(
-                        movement.id
-                    )
-
-    remaining_bank = [
-        movement
-        for movement in bank_movements
-        if movement.id not in matched_bank and movement.id not in annotated_bank
-    ]
-    remaining_books = [
-        movement
-        for movement in book_movements
-        if movement.id not in matched_books and movement.id not in annotated_books
-    ]
-    group_candidates = _group_candidates(remaining_bank, remaining_books)
-    group_frequency = Counter(
-        (side, movement_id)
-        for candidate in group_candidates
-        for side, ids in (("bank", candidate[0]), ("books", candidate[1]))
-        for movement_id in ids
+    consume_pairs(
+        "reference_amount_mismatch",
+        lambda bank, book: bool(bank.reference)
+        and bank.reference == book.reference
+        and bank.amount != book.amount,
+        lambda bank, book: (
+            "La referencia coincide, pero los montos son distintos "
+            f"(banco {bank.transaction_date.isoformat()}, "
+            f"libros {book.transaction_date.isoformat()}). "
+            "Es una diferencia, no una coincidencia confirmable."
+        ),
+        lambda movement: movement.reference if movement.reference else None,
     )
-    for bank_ids, book_ids in group_candidates:
-        participant_keys = [
-            *(("bank", movement_id) for movement_id in bank_ids),
-            *(("books", movement_id) for movement_id in book_ids),
-        ]
-        if all(group_frequency[key] == 1 for key in participant_keys):
-            proposals.append(
-                Proposal(
-                    "reference_date_group",
-                    bank_ids,
-                    book_ids,
-                    f"Referencia y fecha exactas; agrupación limitada a {MAX_GROUP_SIZE} partidas.",
-                )
-            )
-            matched_bank.update(bank_ids)
-            matched_books.update(book_ids)
-        else:
-            proposals.append(
-                Proposal(
-                    "ambiguous",
-                    bank_ids,
-                    book_ids,
-                    "Hay varias agrupaciones posibles con referencia, fecha y monto coincidentes.",
-                )
-            )
-            annotated_bank.update(bank_ids)
-            annotated_books.update(book_ids)
-
-    remaining_bank_by_reference = _by_reference(
-        [
-            movement
-            for movement in bank_movements
-            if movement.id not in matched_bank and movement.id not in annotated_bank
-        ]
-    )
-    remaining_books_by_reference = _by_reference(
-        [
-            movement
-            for movement in book_movements
-            if movement.id not in matched_books and movement.id not in annotated_books
-        ]
-    )
-    for reference in remaining_bank_by_reference.keys() & remaining_books_by_reference.keys():
-        for bank in remaining_bank_by_reference[reference]:
-            for book in remaining_books_by_reference[reference]:
-                if book.amount != bank.amount:
-                    proposals.append(
-                        Proposal(
-                            "reference_amount_mismatch",
-                            (bank.id,),
-                            (book.id,),
-                            "La referencia coincide, pero los montos son distintos.",
-                        )
-                    )
-                    annotated_bank.add(bank.id)
-                    annotated_books.add(book.id)
 
     for movement in bank_movements:
-        if movement.id not in matched_bank and movement.id not in annotated_bank:
+        if movement.id not in claimed_bank:
             proposals.append(
                 Proposal("unmatched", (movement.id,), (), "Sin contraparte identificada.")
             )
     for movement in book_movements:
-        if movement.id not in matched_books and movement.id not in annotated_books:
+        if movement.id not in claimed_books:
             proposals.append(
                 Proposal("unmatched", (), (movement.id,), "Sin contraparte identificada.")
             )
-
     return proposals
 
 
-def _by_reference(movements: list[Movement]) -> dict[str, list[Movement]]:
-    grouped: dict[str, list[Movement]] = defaultdict(list)
-    for movement in movements:
-        if movement.reference:
-            grouped[movement.reference].append(movement)
-    return grouped
+def _pair_components(bank_movements, book_movements, predicate, candidate_key):
+    bank_groups = defaultdict(list)
+    book_groups = defaultdict(list)
+    for movement in bank_movements:
+        key = candidate_key(movement)
+        if key is not None:
+            bank_groups[key].append(movement)
+    for movement in book_movements:
+        key = candidate_key(movement)
+        if key is not None:
+            book_groups[key].append(movement)
 
-
-def _unique_pairs(bank_movements, book_movements, predicate):
-    pairs = []
-    for bank in bank_movements:
-        candidates = [book for book in book_movements if predicate(bank, book)]
-        if len(candidates) != 1:
+    components = []
+    comparisons = 0
+    for key in bank_groups.keys() & book_groups.keys():
+        banks, books = bank_groups[key], book_groups[key]
+        comparisons += len(banks) * len(books)
+        if comparisons > MAX_PAIR_COMPARISONS:
+            components.append((banks, books))
             continue
-        book = candidates[0]
-        reverse = [candidate for candidate in bank_movements if predicate(candidate, book)]
-        if len(reverse) == 1:
-            pairs.append((bank, book))
-    return pairs
-
-
-def _append_ambiguity(proposals, movement, candidates, side, explanation):
-    bank_ids = (movement.id,) if side == "bank" else tuple(
-        candidate.id for candidate in candidates
-    )
-    book_ids = tuple(candidate.id for candidate in candidates) if side == "bank" else (
-        movement.id,
-    )
-    proposals.append(Proposal("ambiguous", bank_ids, book_ids, explanation))
-
-
-def _group_candidates(bank_movements, book_movements):
-    candidates = []
-    for bank_groups, book_groups, bank_is_group in (
-        (bank_movements, book_movements, False),
-        (book_movements, bank_movements, True),
-    ):
-        for singleton in bank_groups:
-            if not singleton.reference:
+        graph: dict[tuple[str, str], set[tuple[str, str]]] = defaultdict(set)
+        for bank in banks:
+            for book in books:
+                if predicate(bank, book):
+                    bank_key, book_key = ("bank", bank.id), ("books", book.id)
+                    graph[bank_key].add(book_key)
+                    graph[book_key].add(bank_key)
+        visited: set[tuple[str, str]] = set()
+        for node in graph:
+            if node in visited:
                 continue
-            eligible = [
-                movement
-                for movement in book_groups
-                if movement.reference == singleton.reference
-                and movement.transaction_date == singleton.transaction_date
-            ]
-            for size in range(2, min(MAX_GROUP_SIZE, len(eligible)) + 1):
-                for group in combinations(eligible, size):
-                    if sum((movement.amount for movement in group), Decimal("0")) != singleton.amount:
-                        continue
-                    bank_ids, book_ids = (
-                        (tuple(item.id for item in group), (singleton.id,))
-                        if bank_is_group
-                        else ((singleton.id,), tuple(item.id for item in group))
-                    )
-                    candidates.append((bank_ids, book_ids))
-    return candidates
+            pending = [node]
+            visited.add(node)
+            bank_ids, book_ids = set(), set()
+            while pending:
+                current = pending.pop()
+                (bank_ids if current[0] == "bank" else book_ids).add(current[1])
+                for neighbor in graph[current]:
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        pending.append(neighbor)
+            components.append(
+                (
+                    [item for item in banks if item.id in bank_ids],
+                    [item for item in books if item.id in book_ids],
+                )
+            )
+    return components
+
+
+def _group_components(bank_movements, book_movements):
+    by_reference_date_bank = defaultdict(list)
+    by_reference_date_books = defaultdict(list)
+    for movement in bank_movements:
+        if movement.reference:
+            by_reference_date_bank[(movement.reference, movement.transaction_date)].append(movement)
+    for movement in book_movements:
+        if movement.reference:
+            by_reference_date_books[(movement.reference, movement.transaction_date)].append(movement)
+
+    result = []
+    for key in by_reference_date_bank.keys() & by_reference_date_books.keys():
+        banks = by_reference_date_bank[key]
+        books = by_reference_date_books[key]
+        candidates = []
+        search_exceeded = False
+        combinations_examined = 0
+        for singletons, grouped, bank_is_singleton in (
+            (banks, books, True),
+            (books, banks, False),
+        ):
+            for singleton in singletons:
+                for size in range(2, min(MAX_GROUP_SIZE, len(grouped)) + 1):
+                    for group in combinations(grouped, size):
+                        combinations_examined += 1
+                        if combinations_examined > MAX_GROUP_CANDIDATES:
+                            search_exceeded = True
+                            break
+                        if sum((item.amount for item in group), Decimal("0")) != singleton.amount:
+                            continue
+                        group_ids = tuple(sorted(item.id for item in group))
+                        candidates.append(
+                            ((singleton.id,), group_ids)
+                            if bank_is_singleton
+                            else (group_ids, (singleton.id,))
+                        )
+                    if search_exceeded:
+                        break
+                if search_exceeded:
+                    break
+            if search_exceeded:
+                break
+
+        if search_exceeded:
+            result.append(
+                (
+                    (tuple(sorted(item.id for item in banks)),
+                     tuple(sorted(item.id for item in books))),
+                    True,
+                )
+            )
+            continue
+        if not candidates:
+            continue
+        participants = defaultdict(set)
+        for index, (bank_ids, book_ids) in enumerate(candidates):
+            for movement_id in bank_ids:
+                participants[("bank", movement_id)].add(index)
+            for movement_id in book_ids:
+                participants[("books", movement_id)].add(index)
+        candidate_graph = defaultdict(set)
+        for indexes in participants.values():
+            for index in indexes:
+                candidate_graph[index].update(indexes - {index})
+        visited = set()
+        for index in range(len(candidates)):
+            if index in visited:
+                continue
+            pending = [index]
+            component = set()
+            while pending:
+                current = pending.pop()
+                if current in component:
+                    continue
+                component.add(current)
+                pending.extend(candidate_graph[current] - component)
+            visited.update(component)
+            bank_ids = tuple(sorted({
+                movement_id
+                for candidate_index in component
+                for movement_id in candidates[candidate_index][0]
+            }))
+            book_ids = tuple(sorted({
+                movement_id
+                for candidate_index in component
+                for movement_id in candidates[candidate_index][1]
+            }))
+            result.append(((bank_ids, book_ids), len(component) > 1))
+    return result
