@@ -72,7 +72,8 @@ def _current_reconciliation(cursor, request, reconciliation_id, *, lock):
         JOIN contared.accesos a ON a.usuario_id=u.id
         JOIN contared.empresas e ON e.id=a.empresa_id
         WHERE u.auth_user_id=%s AND u.activo IS TRUE
-          AND e.activa IS TRUE AND a.empresa_id=%s AND a.pais_codigo=%s
+          AND e.activa IS TRUE AND a.activo IS TRUE
+          AND a.empresa_id=%s AND a.pais_codigo=%s
         {"FOR SHARE OF u,a,e" if lock else ""}
         """,
         [request.user.auth_user_id, row[2], row[3]],

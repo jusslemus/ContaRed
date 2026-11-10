@@ -16,6 +16,15 @@ class DatabaseUnavailable(APIException):
     default_code = "database_unavailable"
 
 
+class PasswordChangeMigrationRequired(APIException):
+    status_code = 503
+    default_detail = (
+        "Aplica supabase/migrations/202611100002_cambio_clave_obligatorio.sql "
+        "antes de habilitar el acceso a ContaRed."
+    )
+    default_code = "password_change_migration_required"
+
+
 def database_error_details(exc: DatabaseError) -> str:
     cause = exc.__cause__ or exc
     sqlstate = getattr(cause, "sqlstate", None) or getattr(cause, "pgcode", None)
@@ -37,14 +46,14 @@ def database_error_details(exc: DatabaseError) -> str:
     return ", ".join(details)
 
 
-def load_session_access(auth_user_id: UUID) -> dict:
+def load_session_access(auth_user_id: UUID, *, allow_password_change=False) -> dict:
     try:
         with transaction.atomic():
             with connection.cursor() as cursor:
                 cursor.execute("SET TRANSACTION READ ONLY")
                 cursor.execute(
                     """
-                    SELECT id::text, nombre, activo
+                    SELECT id::text, nombre, activo, cambio_clave_obligatorio
                     FROM contared.usuarios
                     WHERE auth_user_id = %s
                     """,
@@ -57,11 +66,16 @@ def load_session_access(auth_user_id: UUID) -> dict:
                         code="profile_not_found",
                     )
 
-                user_id, user_name, active = profile
+                user_id, user_name, active, password_change_required = profile
                 if not active:
                     raise PermissionDenied(
                         "Tu perfil de ContaRed está inactivo. Contacta al administrador.",
                         code="profile_inactive",
+                    )
+                if password_change_required and not allow_password_change:
+                    raise PermissionDenied(
+                        "Debes establecer una nueva contraseña antes de usar ContaRed.",
+                        code="password_change_required",
                     )
 
                 cursor.execute(
@@ -78,6 +92,7 @@ def load_session_access(auth_user_id: UUID) -> dict:
                     INNER JOIN contared.paises AS p
                         ON p.codigo = a.pais_codigo
                     WHERE a.usuario_id = %s
+                      AND a.activo IS TRUE
                       AND e.activa IS TRUE
                       AND p.codigo IN ('SV', 'GT')
                     ORDER BY p.codigo, e.nombre, a.rol
@@ -96,6 +111,10 @@ def load_session_access(auth_user_id: UUID) -> dict:
                 ]
 
     except DatabaseError as exc:
+        cause = exc.__cause__ or exc
+        diagnostic = getattr(cause, "diag", None)
+        if diagnostic and getattr(diagnostic, "column_name", None) == "cambio_clave_obligatorio":
+            raise PasswordChangeMigrationRequired() from exc
         logger.error(
             "ContaRed session lookup failed (%s).",
             database_error_details(exc),
@@ -114,6 +133,7 @@ def load_session_access(auth_user_id: UUID) -> dict:
 
     return {
         "usuario": {"id": user_id, "nombre": user_name},
+        "cambio_clave_obligatorio": password_change_required,
         "accesos": accesses,
         "paises": [
             {"codigo": code, "nombre": authorized_countries[code]}

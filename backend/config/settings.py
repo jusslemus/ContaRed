@@ -67,6 +67,7 @@ SUPABASE_JWKS_URL = os.getenv(
     f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json" if SUPABASE_URL else "",
 )
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_AUTH_REDIRECT_URL = os.getenv("SUPABASE_AUTH_REDIRECT_URL", "")
 IMPORT_PREVIEW_STORAGE_DIR = Path(
     os.getenv("IMPORT_PREVIEW_STORAGE_DIR", str(BASE_DIR / "private_storage" / "import_previews"))
 )
@@ -87,6 +88,34 @@ REST_FRAMEWORK = {
     ],
     "UNAUTHENTICATED_USER": None,
     "EXCEPTION_HANDLER": "contared_api.exceptions.api_exception_handler",
+}
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "request_traceback": {
+            "format": "%(asctime)s %(levelname)s %(name)s %(message)s",
+        },
+    },
+    "handlers": {
+        "request_traceback_console": {
+            "class": "logging.StreamHandler",
+            "formatter": "request_traceback",
+        },
+    },
+    "loggers": {
+        "django.request": {
+            "handlers": ["request_traceback_console"],
+            "level": "ERROR",
+            "propagate": False,
+        },
+        "contared_api.user_administration": {
+            "handlers": ["request_traceback_console"],
+            "level": "WARNING",
+            "propagate": False,
+        },
+    },
 }
 
 LANGUAGE_CODE = "es"

@@ -12,6 +12,7 @@ type Props = {
   role: string;
   mode: "new" | "history";
   cuentaId?: string;
+  initialAccountId?: string;
   bancoId?: string;
   onBackToAccount?: () => void;
   onBackToBank?: () => void;
@@ -20,6 +21,61 @@ type Props = {
 
 type DocumentFile = { name: string; size: number; lastModified: number };
 type Stage = { name: string; status: "pendiente" | "en_curso" | "completo" | "fallido" };
+type AccountOption = {
+  id: string;
+  banco_id: string;
+  banco: string;
+  alias: string;
+  numero: string;
+  numero_terminacion?: string | null;
+  numero_completo?: string | null;
+  moneda_codigo: string;
+  activa: boolean;
+  banco_activo: boolean;
+  numero_completo_verificado?: boolean;
+  incorporacion_provisional?: boolean;
+  codigo_contable?: string | null;
+};
+type AccountLinkSuggestion = { numero_completo: string; terminacion: string; cuenta_id: string; requiere_confirmacion: boolean };
+type DashboardReturnState = {
+  jobId: string;
+  accountId: string;
+  result: Record<string, any>;
+  account: AccountOption | null;
+  stage: "idle" | "clarifications" | "complete";
+  period: string;
+};
+
+function accountNumberLabel(account: AccountOption) {
+  const full = account.numero_completo ?? (account.numero_completo_verificado ? account.numero : null);
+  if (full) return `Número completo ${full}`;
+  const ending = account.numero_terminacion ?? (/^\d{4}$/.test(account.numero) ? account.numero : null);
+  return ending ? `Terminación ${ending}` : `Número ${account.numero}`;
+}
+
+function isCuscatlanAccount(account: AccountOption | null) {
+  const identity = `${account?.banco ?? ""} ${account?.alias ?? ""}`
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+  return identity.includes("cuscat") || identity.includes("cusca 2509");
+}
+
+function structuredErrorMessage(payload: unknown): string | null {
+  if (typeof payload === "string") return payload;
+  if (Array.isArray(payload)) {
+    const messages = payload.map(structuredErrorMessage).filter((value): value is string => Boolean(value));
+    return messages.length ? messages.join(" ") : null;
+  }
+  if (typeof payload !== "object" || payload === null) return null;
+  const record = payload as Record<string, unknown>;
+  for (const key of ["detail", "message", "error", "cuenta_id", "files", "pais_codigo"]) {
+    const message = structuredErrorMessage(record[key]);
+    if (message) return message;
+  }
+  const messages = Object.values(record).map(structuredErrorMessage).filter((value): value is string => Boolean(value));
+  return messages.length ? messages.join(" ") : null;
+}
 
 function formatStateLabel(value: unknown) {
   switch (String(value ?? "")) {
@@ -64,8 +120,24 @@ export default function DirectReconciliationModule(props: Props) {
   const [documentFiles, setDocumentFiles] = useState<File[]>([]);
   const [historyJobs, setHistoryJobs] = useState<Record<string, unknown>[]>([]);
   const [activeJobId, setActiveJobId] = useState("");
+  const [activeJobAccountId, setActiveJobAccountId] = useState("");
   const [apiError, setApiError] = useState("");
   const [activeResult, setActiveResult] = useState<Record<string, any> | null>(null);
+  const [dashboardReturnState, setDashboardReturnState] = useState<DashboardReturnState | null>(null);
+  const [accounts, setAccounts] = useState<AccountOption[]>([]);
+  const [selectedAccount, setSelectedAccount] = useState<AccountOption | null>(null);
+  const [accountLinkSuggestion, setAccountLinkSuggestion] = useState<AccountLinkSuggestion | null>(null);
+  const [accountSearch, setAccountSearch] = useState("");
+  const [accountModalOpen, setAccountModalOpen] = useState(false);
+  const [accountLoading, setAccountLoading] = useState(false);
+  const [accountError, setAccountError] = useState("");
+  const [accountReload, setAccountReload] = useState(0);
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
+  const [selectedPeriod, setSelectedPeriod] = useState(() => {
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+  });
   const [dashboardTab, setDashboardTab] = useState<"resumen" | "proceso" | "depositos" | "cheques">("resumen");
   const [stage, setStage] = useState<"idle" | "analyzing" | "clarifications" | "complete">("idle");
   const [stages, setStages] = useState<Stage[]>([
@@ -80,6 +152,45 @@ export default function DirectReconciliationModule(props: Props) {
   const storageKey = `contared-direct-${props.session.user.id}-${props.companyId}-${props.countryCode}`;
   const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "");
   const authHeaders = { Authorization: `Bearer ${props.session.access_token}` };
+
+  useEffect(() => {
+    if (!apiBaseUrl || props.mode !== "new") return;
+    let active = true;
+    setAccountLoading(true);
+    setAccountError("");
+    void (async () => {
+      try {
+        const allAccounts: AccountOption[] = [];
+        let page = 1;
+        let count = 0;
+        do {
+          const params = new URLSearchParams({
+            empresa_id: props.companyId,
+            pais_codigo: props.countryCode,
+            active: "true",
+            page: String(page),
+            page_size: "100",
+          });
+          const response = await fetch(`${apiBaseUrl}/api/v1/cuentas/?${params}`, { headers: authHeaders });
+          if (!response.ok) throw new Error(await responseError(response, `No se pudieron cargar las cuentas autorizadas (HTTP ${response.status}).`));
+          const payload = await response.json() as { count?: number; results?: AccountOption[] };
+          allAccounts.push(...(payload.results ?? []).filter((item) =>
+            !item.id.startsWith("catalogo:") && item.activa && item.banco_activo && Boolean(item.moneda_codigo)));
+          count = payload.count ?? allAccounts.length;
+          page += 1;
+        } while (allAccounts.length < count && page <= 100);
+        if (!active) return;
+        setAccounts(allAccounts);
+        const requested = allAccounts.find((item) => item.id === props.initialAccountId);
+        setSelectedAccount((current) => requested ?? current ?? null);
+      } catch (error: unknown) {
+        if (active) setAccountError(error instanceof Error ? error.message : "No se pudieron cargar las cuentas autorizadas.");
+      } finally {
+        if (active) setAccountLoading(false);
+      }
+    })();
+    return () => { active = false; };
+  }, [apiBaseUrl, props.mode, props.companyId, props.countryCode, props.session.access_token, props.initialAccountId, accountReload]);
 
   useEffect(() => {
     if (!apiBaseUrl || props.mode !== "history") return;
@@ -111,6 +222,7 @@ export default function DirectReconciliationModule(props: Props) {
   useEffect(() => {
     if (!apiBaseUrl || props.mode !== "new") return;
     const params = new URLSearchParams({ empresa_id: props.companyId, pais_codigo: props.countryCode });
+    if (props.initialAccountId) params.set("cuenta_id", props.initialAccountId);
     void fetch(`${apiBaseUrl}/api/v1/conciliaciones-directas/trabajos/?${params}`, { headers: authHeaders })
       .then(async (response) => {
         if (!response.ok) throw new Error(await responseError(response, `No se pudo recuperar el último trabajo (HTTP ${response.status}).`));
@@ -118,12 +230,13 @@ export default function DirectReconciliationModule(props: Props) {
         const latest = payload.trabajos?.[0];
         if (!latest) return;
         setActiveJobId(String(latest.id));
-        void loadJob(String(latest.id)).catch((error: unknown) => setApiError(error instanceof Error ? error.message : "No se pudo recuperar el resultado."));
+        setActiveJobAccountId(String(latest.cuenta_id ?? ""));
+        void loadJob(String(latest.id), String(latest.cuenta_id ?? "")).catch((error: unknown) => setApiError(error instanceof Error ? error.message : "No se pudo recuperar el resultado."));
         const estado = String(latest.estado);
         setStage(estado === "preparado" ? "complete" : estado === "requiere_aclaraciones" ? "clarifications" : "idle");
       })
       .catch((error: unknown) => setApiError(error instanceof Error ? error.message : "No se pudo recuperar el último trabajo."));
-  }, [apiBaseUrl, props.mode, props.companyId, props.countryCode, props.session.access_token]);
+  }, [apiBaseUrl, props.mode, props.companyId, props.countryCode, props.session.access_token, props.initialAccountId]);
 
   useEffect(() => {
     localStorage.setItem(storageKey, JSON.stringify({ documents, stage }));
@@ -133,22 +246,88 @@ export default function DirectReconciliationModule(props: Props) {
     const contentType = response.headers.get("content-type") || "";
     if (contentType.includes("application/json")) {
       const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
-      const detail = payload?.detail ?? payload?.message ?? payload?.error;
-      if (typeof detail === "string") return detail;
+      const detail = structuredErrorMessage(payload);
+      if (detail) return detail;
     }
     return fallback;
   }
 
-  async function loadJob(jobId: string) {
+  async function jsonResponse(
+    response: Response,
+    fallback: string,
+  ): Promise<Record<string, unknown>> {
+    const contentType = response.headers.get("content-type") || "sin Content-Type";
+    const body = await response.text();
+    let payload: unknown;
+    try {
+      payload = JSON.parse(body);
+    } catch {
+      const endpoint = response.url ? new URL(response.url).pathname : "endpoint de análisis";
+      const responseType = contentType.split(";", 1)[0];
+      throw new Error(
+        `El servidor respondió con contenido no JSON a POST ${endpoint} (HTTP ${response.status}, ${responseType}). La cuenta y los archivos siguen seleccionados. Verifica la URL del backend y revisa su registro para conocer el error.`,
+      );
+    }
+    if (!response.ok) {
+      throw new Error(structuredErrorMessage(payload) ?? fallback);
+    }
+    if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+      throw new Error(`El servidor devolvió una respuesta JSON no válida (HTTP ${response.status}). La cuenta y los archivos siguen seleccionados.`);
+    }
+    return payload as Record<string, unknown>;
+  }
+
+  async function loadJob(jobId: string, requestedAccountId?: string) {
     if (!apiBaseUrl) return;
     setApiError("");
     const params = new URLSearchParams({ empresa_id: props.companyId, pais_codigo: props.countryCode });
+    if (requestedAccountId) params.set("cuenta_id", requestedAccountId);
     const response = await fetch(`${apiBaseUrl}/api/v1/conciliaciones-directas/trabajos/${jobId}/?${params}`, { headers: authHeaders });
     if (!response.ok) throw new Error(await responseError(response, `No se pudo recuperar el trabajo (HTTP ${response.status}).`));
-    const job = await response.json() as { id: string; resultado?: Record<string, any>; estado: string };
+    const job = await response.json() as { id: string; cuenta_id?: string; cuenta_seleccionada?: AccountOption; vinculacion_cuenta?: AccountLinkSuggestion | null; resultado?: Record<string, any>; estado: string };
     setActiveJobId(job.id);
+    setActiveJobAccountId(job.cuenta_id ?? "");
+    if (job.cuenta_seleccionada) setSelectedAccount(job.cuenta_seleccionada);
+    setAccountLinkSuggestion(job.vinculacion_cuenta ?? null);
     setActiveResult(job.resultado ?? {});
+    const savedPeriod = job.resultado?.contexto_resultado?.periodo;
+    if (typeof savedPeriod === "string" && /^\d{4}-\d{2}$/.test(savedPeriod)) setSelectedPeriod(savedPeriod);
     setStage(job.estado === "preparado" ? "complete" : job.estado === "requiere_aclaraciones" ? "clarifications" : "idle");
+  }
+
+  async function openPreviousReconciliation(jobId: string, accountId: string) {
+    if (activeResult && !dashboardReturnState) {
+      setDashboardReturnState({
+        jobId: activeJobId,
+        accountId: activeJobAccountId,
+        result: activeResult,
+        account: selectedAccount,
+        stage: stage === "complete" ? "complete" : stage === "clarifications" ? "clarifications" : "idle",
+        period: selectedPeriod,
+      });
+    }
+    try {
+      await loadJob(jobId, accountId);
+    } catch (error: unknown) {
+      setDashboardReturnState(null);
+      setApiError(error instanceof Error ? error.message : "No se pudo abrir la conciliación anterior.");
+    }
+  }
+
+  function returnFromPreviousReconciliation() {
+    if (dashboardReturnState) {
+      setActiveJobId(dashboardReturnState.jobId);
+      setActiveJobAccountId(dashboardReturnState.accountId);
+      setActiveResult(dashboardReturnState.result);
+      setSelectedAccount(dashboardReturnState.account);
+      setSelectedPeriod(dashboardReturnState.period);
+      setStage(dashboardReturnState.stage);
+      setDashboardReturnState(null);
+      return;
+    }
+    setActiveResult(null);
+    setActiveJobId("");
+    setActiveJobAccountId("");
   }
 
   function addFiles(files: FileList | null) {
@@ -181,7 +360,33 @@ export default function DirectReconciliationModule(props: Props) {
     setStage("idle");
   }
 
+  function chooseAccount(account: AccountOption) {
+    if (activeJobId && activeJobAccountId !== account.id) {
+      if (!window.confirm("El resultado analizado no se reasignará. Para usar esta cuenta debes iniciar un análisis nuevo con los documentos actuales. ¿Continuar?")) return;
+      setActiveJobId("");
+      setActiveJobAccountId("");
+      setActiveResult(null);
+      setAccountLinkSuggestion(null);
+      setStage("idle");
+      setStages([
+        { name: "Recibir archivos", status: "pendiente" },
+        { name: "Identificar hojas y datos", status: "pendiente" },
+        { name: "Cruzar movimientos", status: "pendiente" },
+        { name: "Preparar informe", status: "pendiente" },
+      ]);
+    }
+    setSelectedAccount(account);
+    setAccountModalOpen(false);
+    setAccountSearch("");
+    setApiError("");
+  }
+
   async function analyze() {
+    if (!selectedAccount) {
+      setAccountModalOpen(true);
+      setApiError("Elige una cuenta autorizada antes de iniciar el análisis.");
+      return;
+    }
     if (!documentFiles.length) {
       setApiError("Selecciona los documentos originales antes de iniciar el análisis.");
       return;
@@ -196,22 +401,31 @@ export default function DirectReconciliationModule(props: Props) {
       const form = new FormData();
       form.append("empresa_id", props.companyId);
       form.append("pais_codigo", props.countryCode);
+      form.append("cuenta_id", selectedAccount.id);
+      if (isCuscatlanAccount(selectedAccount)) form.append("periodo", selectedPeriod);
       documentFiles.forEach((file) => form.append("files", file));
       const response = await fetch(`${apiBaseUrl}/api/v1/conciliaciones-directas/trabajos/`, {
         method: "POST",
-        headers: authHeaders,
+        headers: { ...authHeaders, Accept: "application/json" },
         body: form,
       });
-      const payload = await response.json() as Record<string, unknown>;
-      if (!response.ok) throw new Error(typeof payload.detail === "string" ? payload.detail : `El servidor rechazó el análisis (HTTP ${response.status}).`);
+      const payload = await jsonResponse(response, `El servidor rechazó el análisis (HTTP ${response.status}).`);
       const job = payload as {
         id: string;
+        cuenta_id: string;
+        cuenta_seleccionada?: AccountOption;
+        vinculacion_cuenta?: AccountLinkSuggestion | null;
         estado: string;
         progreso: { etapa: string; estado: Stage["status"] }[];
         resultado?: Record<string, any>;
       };
       setActiveJobId(job.id);
+      setActiveJobAccountId(job.cuenta_id);
+      if (job.cuenta_seleccionada) setSelectedAccount(job.cuenta_seleccionada);
+      setAccountLinkSuggestion(job.vinculacion_cuenta ?? null);
       setActiveResult(job.resultado ?? null);
+      const savedPeriod = job.resultado?.contexto_resultado?.periodo;
+      if (typeof savedPeriod === "string" && /^\d{4}-\d{2}$/.test(savedPeriod)) setSelectedPeriod(savedPeriod);
       setStages((current) => current.map((item, index) => {
         const server = job.progreso[index];
         return server ? { name: item.name, status: server.estado } : item;
@@ -231,6 +445,7 @@ export default function DirectReconciliationModule(props: Props) {
       pais_codigo: props.countryCode,
       formato: "xlsx",
     });
+    if (activeJobAccountId) params.set("cuenta_id", activeJobAccountId);
     void fetch(`${apiBaseUrl}/api/v1/conciliaciones-directas/trabajos/${activeJobId}/reporte/?${params}`, { headers: authHeaders })
       .then(async (response) => {
         if (!response.ok) throw new Error(await responseError(response, `No se pudo descargar el informe (HTTP ${response.status}).`));
@@ -252,6 +467,7 @@ export default function DirectReconciliationModule(props: Props) {
       pais_codigo: props.countryCode,
       formato: "pdf",
     });
+    if (activeJobAccountId) params.set("cuenta_id", activeJobAccountId);
     void fetch(`${apiBaseUrl}/api/v1/conciliaciones-directas/trabajos/${activeJobId}/reporte/?${params}`, { headers: authHeaders })
       .then(async (response) => {
         if (!response.ok) throw new Error(await responseError(response, `No se pudo descargar el PDF (HTTP ${response.status}).`));
@@ -266,14 +482,39 @@ export default function DirectReconciliationModule(props: Props) {
       .catch((error: unknown) => setApiError(error instanceof Error ? error.message : "No se pudo descargar el PDF."));
   }
 
+  async function downloadSource(filename: string) {
+    if (!activeJobId || !activeJobAccountId || !apiBaseUrl) return;
+    const params = new URLSearchParams({ empresa_id: props.companyId, pais_codigo: props.countryCode, cuenta_id: activeJobAccountId });
+    const response = await fetch(
+      `${apiBaseUrl}/api/v1/conciliaciones-directas/trabajos/${activeJobId}/archivos/${encodeURIComponent(filename)}/?${params}`,
+      { headers: authHeaders },
+    );
+    if (!response.ok) throw new Error(await responseError(response, `No se pudo abrir el documento de origen (HTTP ${response.status}).`));
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
   async function saveToHistory() {
     if (!activeJobId || !apiBaseUrl) return;
+    if (savingRef.current) return;
+    savingRef.current = true;
+    setSaving(true);
     setApiError("");
     try {
       const response = await fetch(`${apiBaseUrl}/api/v1/conciliaciones-directas/trabajos/${activeJobId}/`, {
         method: "POST",
         headers: { ...authHeaders, "Content-Type": "application/json" },
-        body: JSON.stringify({ empresa_id: props.companyId, pais_codigo: props.countryCode, accion: "finalizar" }),
+        body: JSON.stringify({
+          empresa_id: props.companyId,
+          pais_codigo: props.countryCode,
+          cuenta_id: activeJobAccountId,
+          accion: "finalizar",
+        }),
       });
       if (!response.ok) throw new Error(await responseError(response, `No se pudo guardar el trabajo (HTTP ${response.status}).`));
       const savedJob = await response.json() as { cuenta_id?: string };
@@ -281,15 +522,19 @@ export default function DirectReconciliationModule(props: Props) {
       setDocuments([]);
       setActiveResult(null);
       setActiveJobId("");
+      setActiveJobAccountId("");
       setStage("idle");
       localStorage.removeItem(storageKey);
       if (savedJob.cuenta_id) props.onSavedAccount?.(savedJob.cuenta_id);
     } catch (error: unknown) {
       setApiError(error instanceof Error ? error.message : "No se pudo guardar el trabajo.");
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
     }
   }
 
-  async function recalculateJob(jobId = activeJobId) {
+  async function recalculateJob(jobId = activeJobId, accountId = activeJobAccountId) {
     if (!jobId || !apiBaseUrl) return;
     if (!window.confirm("Se sustituirá el resultado visible solo cuando termine el recálculo. El resultado anterior se conservará si ocurre un fallo.")) return;
     setApiError("");
@@ -298,7 +543,9 @@ export default function DirectReconciliationModule(props: Props) {
       const form = new FormData();
       form.append("empresa_id", props.companyId);
       form.append("pais_codigo", props.countryCode);
+      form.append("cuenta_id", accountId);
       form.append("accion", "recalcular");
+      if (isCuscatlanAccount(selectedAccount)) form.append("periodo", selectedPeriod);
       if (props.mode === "new") documentFiles.forEach((file) => form.append("files", file));
       const response = await fetch(`${apiBaseUrl}/api/v1/conciliaciones-directas/trabajos/${jobId}/`, {
         method: "POST",
@@ -306,13 +553,48 @@ export default function DirectReconciliationModule(props: Props) {
         body: form,
       });
       if (!response.ok) throw new Error(await responseError(response, `No se pudo recalcular (HTTP ${response.status}).`));
-      const job = await response.json() as { id: string; resultado?: Record<string, any>; estado: string };
+      const job = await response.json() as { id: string; cuenta_id?: string; cuenta_seleccionada?: AccountOption; vinculacion_cuenta?: AccountLinkSuggestion | null; resultado?: Record<string, any>; estado: string };
       setActiveJobId(job.id);
+      setActiveJobAccountId(job.cuenta_id ?? accountId);
+      if (job.cuenta_seleccionada) setSelectedAccount(job.cuenta_seleccionada);
+      setAccountLinkSuggestion(job.vinculacion_cuenta ?? null);
       setActiveResult(job.resultado ?? {});
+      const savedPeriod = job.resultado?.contexto_resultado?.periodo;
+      if (typeof savedPeriod === "string" && /^\d{4}-\d{2}$/.test(savedPeriod)) setSelectedPeriod(savedPeriod);
       setStage(job.estado === "requiere_aclaraciones" ? "clarifications" : "complete");
     } catch (error: unknown) {
       setStage("idle");
       setApiError(error instanceof Error ? error.message : "El recálculo falló; se conservó el resultado anterior.");
+    }
+  }
+
+  async function confirmAccountNumberLink() {
+    if (!activeJobId || !activeJobAccountId || !accountLinkSuggestion || !apiBaseUrl) return;
+    const confirmed = window.confirm(
+      `¿Confirmas vincular la cuenta activa por terminación ${accountLinkSuggestion.terminacion} con el número completo ${accountLinkSuggestion.numero_completo}? No se creará otra cuenta.`
+    );
+    if (!confirmed) return;
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/v1/conciliaciones-directas/trabajos/${activeJobId}/`, {
+        method: "POST",
+        headers: { ...authHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          empresa_id: props.companyId,
+          pais_codigo: props.countryCode,
+          cuenta_id: activeJobAccountId,
+          accion: "vincular_numero",
+        }),
+      });
+      if (!response.ok) throw new Error(await responseError(response, `No se pudo vincular el número (HTTP ${response.status}).`));
+      const job = await response.json() as { cuenta_seleccionada?: AccountOption; vinculacion_cuenta?: AccountLinkSuggestion | null };
+      if (job.cuenta_seleccionada) {
+        setSelectedAccount(job.cuenta_seleccionada);
+        setAccounts((current) => current.map((item) => item.id === job.cuenta_seleccionada?.id ? job.cuenta_seleccionada! : item));
+      }
+      setAccountLinkSuggestion(job.vinculacion_cuenta ?? null);
+      setApiError("");
+    } catch (error: unknown) {
+      setApiError(error instanceof Error ? error.message : "No se pudo vincular el número completo.");
     }
   }
 
@@ -354,19 +636,23 @@ export default function DirectReconciliationModule(props: Props) {
         companyName={props.companyName}
         countryCode={props.countryCode}
         saved={true}
-        onBackToHistory={() => { setActiveResult(null); setActiveJobId(""); }}
+        onBackToHistory={returnFromPreviousReconciliation}
+        onBackLabel={dashboardReturnState ? "Volver a la conciliación" : undefined}
         onDownloadExcel={downloadWorkbook}
         onDownloadPdf={downloadPdf}
         onPrint={() => window.print()}
         onRecalculate={() => void recalculateJob(activeJobId)}
+        onOpenPreviousReconciliation={(jobId, accountId) => void openPreviousReconciliation(jobId, accountId)}
+        onOpenSource={(filename) => void downloadSource(filename).catch((error: unknown) => setApiError(error instanceof Error ? error.message : "No se pudo abrir el documento de origen."))}
       />}
       <div className="direct-card">
         {!historyJobs.length ? <p>No hay trabajos registrados en el servidor para este usuario, empresa y país.</p> : <ul className="document-list">
           {historyJobs.map((job) => <li key={String(job.id)}>
             {(() => {
               const context = (job.contexto as Record<string, unknown> | undefined) ?? {};
-              const bank = String(context.banco ?? "Banco no disponible");
-              const account = String(context.cuenta ?? context.numero_cuenta ?? "Cuenta no disponible");
+              const selected = (job.cuenta_seleccionada as AccountOption | undefined) ?? undefined;
+              const bank = String(selected?.banco ?? context.banco ?? "Banco no disponible");
+              const account = selected ? `${selected.alias} · ${accountNumberLabel(selected)}` : String(context.cuenta ?? context.numero_cuenta ?? "Cuenta no disponible");
               const period = formatJobPeriod(job.periodo_sugerido ?? context.periodo ?? context.periodo_declarado);
               const responsible = typeof job.responsable_nombre === "string" && job.responsable_nombre.trim()
                 ? job.responsable_nombre
@@ -375,8 +661,8 @@ export default function DirectReconciliationModule(props: Props) {
               return <span className="history-job-identification"><strong>{bank} · {account}</strong><small>{period}</small><small>{formatStateLabel(job.estado)} · {responsible} · {date}</small></span>;
             })()}
             <span className="document-actions">
-              <button type="button" className="secondary-button" onClick={() => void loadJob(String(job.id)).catch((error: unknown) => setApiError(error instanceof Error ? error.message : "No se pudo abrir el trabajo."))}>Abrir dashboard</button>
-              <button type="button" className="quiet-button" onClick={() => void recalculateJob(String(job.id))}>Recalcular</button>
+              <button type="button" className="secondary-button" onClick={() => void loadJob(String(job.id), String(job.cuenta_id ?? "")).catch((error: unknown) => setApiError(error instanceof Error ? error.message : "No se pudo abrir el trabajo."))}>Abrir dashboard</button>
+              <button type="button" className="quiet-button" onClick={() => void recalculateJob(String(job.id), String(job.cuenta_id ?? ""))}>Recalcular</button>
               <button type="button" className="danger-button" onClick={() => void discardOrDeleteJob(String(job.id), true)}>Eliminar</button>
             </span>
           </li>)}
@@ -386,11 +672,29 @@ export default function DirectReconciliationModule(props: Props) {
   }
 
   return <section className="direct-module">
-    {apiError && <div className="notice error" role="alert"><span>{apiError}</span><button type="button" className="quiet-button" onClick={() => window.location.reload()}>Reintentar</button></div>}
+    {apiError && <div className="notice error" role="alert">
+      <span>{apiError}</span>
+      {activeJobId && activeResult && <button type="button" className="quiet-button" disabled={saving} onClick={() => void saveToHistory()}>{saving ? "Guardando…" : "Reintentar guardar"}</button>}
+      {accountError && <button type="button" className="quiet-button" onClick={() => setAccountReload((value) => value + 1)}>Reintentar cargar cuentas</button>}
+    </div>}
     <header className="direct-header">
       <div><p className="eyebrow">NUEVA CONCILIACIÓN · {props.countryName}</p><h1>Analiza los documentos juntos</h1></div>
       <span className={`analysis-status ${stage}`}>{stage === "complete" ? "Análisis terminado" : stage === "clarifications" ? "Requiere aclaraciones" : stage === "analyzing" ? "Analizando" : "No iniciado"}</span>
     </header>
+
+    <div className="direct-card account-selection">
+      <div>
+        <h2>Cuenta de la conciliación</h2>
+        {selectedAccount ? <>
+          <strong>{selectedAccount.banco} · {selectedAccount.alias}</strong>
+          <span>{accountNumberLabel(selectedAccount)} · {selectedAccount.moneda_codigo}</span>
+          <small>Configuración: {selectedAccount.incorporacion_provisional ? "Activa; falta verificar el número completo" : "Activa"} · Código contable: {selectedAccount.codigo_contable || "No asociado"}</small>
+        </> : <span>Elige una cuenta activa autorizada para esta empresa y país antes de iniciar el análisis.</span>}
+      </div>
+      <button type="button" className={selectedAccount ? "quiet-button" : "primary-button"} disabled={accountLoading || stage === "analyzing"} onClick={() => { setAccountModalOpen(true); setAccountError(""); }}>
+        {selectedAccount ? "Cambiar cuenta" : "Elegir cuenta"}
+      </button>
+    </div>
 
     <div className="direct-card drop-zone" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles(event.dataTransfer.files); }}>
       <input ref={fileInput} hidden type="file" accept=".xlsx,.xls" multiple onChange={(event) => addFiles(event.target.files)} />
@@ -401,6 +705,10 @@ export default function DirectReconciliationModule(props: Props) {
 
     {documents.length > 0 && <div className="direct-card">
       <h2>Documentos recibidos</h2>
+      {isCuscatlanAccount(selectedAccount) && <label className="account-search">
+        Mes y año a conciliar
+        <input type="month" value={selectedPeriod} onChange={(event) => setSelectedPeriod(event.target.value)} required />
+      </label>}
       <ul className="document-list">
         {documents.map((document, index) => <li key={`${document.name}-${document.lastModified}`}>
           <span><strong>{document.name}</strong><small>{(document.size / 1024).toFixed(1)} KiB</small></span>
@@ -411,7 +719,29 @@ export default function DirectReconciliationModule(props: Props) {
           </span>
         </li>)}
       </ul>
-      <button type="button" className="primary-button analyze-button" disabled={stage === "analyzing"} onClick={() => void analyze()}>{stage === "analyzing" ? "Analizando…" : "Analizar y conciliar"}</button>
+      {!selectedAccount && <p className="empty-copy">Selecciona una cuenta para habilitar el análisis.</p>}
+      <button type="button" className="primary-button analyze-button" disabled={stage === "analyzing" || !selectedAccount || (isCuscatlanAccount(selectedAccount) && !selectedPeriod)} onClick={() => void analyze()}>{stage === "analyzing" ? "Analizando…" : "Analizar y conciliar"}</button>
+    </div>}
+
+    {accountModalOpen && <div className="account-modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setAccountModalOpen(false); }} onKeyDown={(event) => { if (event.key === "Escape") setAccountModalOpen(false); }}>
+      <section className="account-modal" role="dialog" aria-modal="true" aria-labelledby="account-modal-title">
+        <header><div><p className="eyebrow">{props.companyName} · {props.countryName}</p><h2 id="account-modal-title">Elegir cuenta</h2></div><button type="button" className="quiet-button" aria-label="Cerrar" onClick={() => setAccountModalOpen(false)}>Cerrar</button></header>
+        <label className="account-search">Buscar por banco, alias o número<input autoFocus type="search" value={accountSearch} onChange={(event) => setAccountSearch(event.target.value)} /></label>
+        {accountLoading ? <p role="status">Cargando cuentas autorizadas…</p> : accountError ? <div className="notice error" role="alert"><span>{accountError}</span><button type="button" className="quiet-button" onClick={() => setAccountReload((value) => value + 1)}>Reintentar</button></div> : null}
+        <ul className="account-options">
+          {accounts.filter((account) => `${account.banco} ${account.alias} ${account.numero} ${account.numero_terminacion ?? ""} ${account.moneda_codigo}`.toLocaleLowerCase().includes(accountSearch.trim().toLocaleLowerCase())).map((account) => (
+            <li key={account.id}>
+              <button type="button" className={selectedAccount?.id === account.id ? "account-option selected" : "account-option"} onClick={() => chooseAccount(account)}>
+                <strong>{account.banco} · {account.alias}</strong>
+                <span>{accountNumberLabel(account)} · {account.moneda_codigo}</span>
+                <small>{account.incorporacion_provisional ? "Configuración activa · número completo pendiente" : "Cuenta activa y configurada"} · Código contable: {account.codigo_contable || "No asociado"}</small>
+              </button>
+            </li>
+          ))}
+          {!accountLoading && !accountError && accounts.length === 0 && <li className="empty-copy">No hay cuentas activas autorizadas para este ámbito.</li>}
+          {!accountLoading && accounts.length > 0 && !accounts.some((account) => `${account.banco} ${account.alias} ${account.numero} ${account.numero_terminacion ?? ""} ${account.moneda_codigo}`.toLocaleLowerCase().includes(accountSearch.trim().toLocaleLowerCase())) && <li className="empty-copy">No hay coincidencias con la búsqueda.</li>}
+        </ul>
+      </section>
     </div>}
 
     {stage === "analyzing" && <div className="direct-card progress-card">
@@ -423,18 +753,28 @@ export default function DirectReconciliationModule(props: Props) {
       <details><summary>Ver detalle del análisis</summary><ol className="stage-list">{stages.map((item) => <li key={item.name}><span className={`stage-dot ${item.status}`} />{item.name}<small>{item.status}</small></li>)}</ol></details>
     </div>}
 
+    {accountLinkSuggestion && <div className="direct-card account-link-suggestion">
+      <div><strong>Coincidencia única por terminación</strong><p>El documento identifica {accountLinkSuggestion.numero_completo} y coincide con {selectedAccount?.banco} {selectedAccount ? accountNumberLabel(selectedAccount) : `terminación ${accountLinkSuggestion.terminacion}`} en {selectedAccount?.moneda_codigo}. El vínculo no altera el análisis ni crea otra cuenta.</p></div>
+      {props.role === "administrador" && <button type="button" className="secondary-button" onClick={() => void confirmAccountNumberLink()}>Confirmar vínculo</button>}
+    </div>}
+
     {activeResult && <ReconciliationDashboard
       result={activeResult}
-      job={{ id: activeJobId, responsable_nombre: undefined, finalizado_en: undefined, actualizado_en: undefined }}
+      job={{ id: activeJobId, cuenta_id: activeJobAccountId, cuenta_seleccionada: selectedAccount, estado: stage === "complete" ? "preparado" : "requiere_aclaraciones", responsable_nombre: undefined, finalizado_en: undefined, actualizado_en: undefined }}
       companyName={props.companyName}
       countryCode={props.countryCode}
-      saved={false}
+      saved={Boolean(dashboardReturnState)}
+      onBackToHistory={dashboardReturnState ? returnFromPreviousReconciliation : undefined}
+      onBackLabel={dashboardReturnState ? "Volver a la conciliación" : undefined}
+      saving={saving}
       onSave={() => void saveToHistory()}
       onDiscard={() => void discardOrDeleteJob()}
       onDownloadExcel={downloadWorkbook}
       onDownloadPdf={downloadPdf}
       onPrint={() => window.print()}
       onRecalculate={() => void recalculateJob()}
+      onOpenPreviousReconciliation={(jobId, accountId) => void openPreviousReconciliation(jobId, accountId)}
+      onOpenSource={(filename) => void downloadSource(filename).catch((error: unknown) => setApiError(error instanceof Error ? error.message : "No se pudo abrir el documento de origen."))}
     />}
     {activeResult && false && (stage === "complete" || stage === "clarifications") && (() => {
       const result = activeResult!;

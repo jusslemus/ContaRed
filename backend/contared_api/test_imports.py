@@ -16,6 +16,7 @@ from django.urls import resolve
 from rest_framework.test import APIClient
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils.datetime import to_excel
+import xlrd
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from rest_framework.test import APIRequestFactory, force_authenticate
@@ -836,6 +837,80 @@ class WorkbookImportTests(SimpleTestCase):
         try:
             self.assertEqual(converted.sheetnames, ["Legacy"])
             self.assertIsNone(converted["Legacy"]["A1"].value)
+        finally:
+            converted.close()
+
+    def test_cuscatlan_headerless_xls_uses_positions_only_for_matching_structure(self):
+        source_path = self.folder / "Movimientos_008303000002509_fixture.xls"
+        target_path = self.folder / "normalized.xlsx"
+        source_path.write_bytes(XLS_SIGNATURE + b"test")
+        rows = [
+            ["30/09/2026", "BANCA ELECTRONICA", "0000123", "ABONO", "+", "5.00", "1005.00", "1005.00"],
+            ["01/10/2026", "BANCA ELECTRONICA", "0000124", "CARGO", "-", "2.00", "1003.00", "1003.00"],
+        ]
+        source_sheet = SimpleNamespace(
+            name="Movimientos",
+            nrows=len(rows),
+            ncols=8,
+            cell=lambda row, column: SimpleNamespace(
+                value=rows[row][column],
+                ctype=xlrd.XL_CELL_NUMBER if column in (5, 6, 7) else xlrd.XL_CELL_TEXT,
+                xf_index=None,
+            ),
+        )
+        source = SimpleNamespace(
+            nsheets=1,
+            sheets=lambda: [source_sheet],
+            datemode=0,
+            xf_list=[],
+            format_map={},
+            release_resources=lambda: None,
+        )
+
+        with patch("contared_api.imports.xlrd.open_workbook", return_value=source):
+            synthetic_header = _normalize_xls(source_path, target_path)
+
+        self.assertTrue(synthetic_header)
+        converted = load_workbook(target_path, read_only=True, data_only=True)
+        try:
+            sheet = converted["Movimientos"]
+            self.assertEqual(sheet["A1"].value, "Fecha Transacción")
+            self.assertEqual(sheet["C2"].value, "0000123")
+            self.assertEqual(sheet["F3"].value, "2.00")
+        finally:
+            converted.close()
+
+    def test_cuscatlan_headerless_xls_with_mismatched_structure_is_not_positionally_mapped(self):
+        source_path = self.folder / "Movimientos_008303000002509_fixture.xls"
+        target_path = self.folder / "normalized.xlsx"
+        source_path.write_bytes(XLS_SIGNATURE + b"test")
+        source_sheet = SimpleNamespace(
+            name="Movimientos",
+            nrows=2,
+            ncols=7,
+            cell=lambda _row, _column: SimpleNamespace(
+                value="texto",
+                ctype=xlrd.XL_CELL_TEXT,
+                xf_index=None,
+            ),
+        )
+        source = SimpleNamespace(
+            nsheets=1,
+            sheets=lambda: [source_sheet],
+            datemode=0,
+            xf_list=[],
+            format_map={},
+            release_resources=lambda: None,
+        )
+
+        with patch("contared_api.imports.xlrd.open_workbook", return_value=source):
+            synthetic_header = _normalize_xls(source_path, target_path)
+
+        self.assertFalse(synthetic_header)
+        converted = load_workbook(target_path, read_only=True, data_only=True)
+        try:
+            self.assertEqual(converted["Movimientos"].max_row, 2)
+            self.assertEqual(converted["Movimientos"]["A1"].value, "texto")
         finally:
             converted.close()
 

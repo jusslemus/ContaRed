@@ -431,6 +431,7 @@ def _locked_scope(cursor, request, reconciliation_id, *, lock=True):
         JOIN contared.empresas e ON e.id=cb.empresa_id AND e.activa IS TRUE
         JOIN contared.accesos a
           ON a.empresa_id=cb.empresa_id AND a.pais_codigo=cb.pais_codigo
+         AND a.activo IS TRUE
         JOIN contared.usuarios u
           ON u.id=a.usuario_id AND u.auth_user_id=%s AND u.activo IS TRUE
         WHERE r.id=%s

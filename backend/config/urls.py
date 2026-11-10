@@ -55,19 +55,39 @@ from contared_api.conciliaciones import (
     UnboundReconciliationPreviewValidateView,
 )
 from contared_api.views import ApiStatusView, SessionView
+from contared_api.user_administration import PasswordSetupView
 from contared_api.reconciliation_summary import ReconciliationSummaryView
+from contared_api.user_administration import (
+    UserAdministrationListInviteView,
+    UserAdministrationPermissionsView,
+    UserAdministrationPasswordResetView,
+    UserAdministrationTemporaryPasswordView,
+    UserAdministrationResendInvitationView,
+    UserAdministrationDeleteView,
+    UserAdministrationUserView,
+)
 from contared_api.direct_reconciliation import (
     DirectReconciliationDetailView,
     DirectReconciliationListCreateView,
     DirectReconciliationReportView,
+    DirectReconciliationSourceView,
 )
 
 urlpatterns = [
     path("api/v1/status/", ApiStatusView.as_view(), name="api-status"),
     path("api/v1/session/", SessionView.as_view(), name="api-session"),
+    path("api/v1/session/password/", PasswordSetupView.as_view(), name="api-session-password"),
+    path("api/v1/administracion/usuarios/", UserAdministrationListInviteView.as_view(), name="api-user-administration"),
+    path("api/v1/administracion/usuarios/<uuid:user_id>/accesos/", UserAdministrationPermissionsView.as_view(), name="api-user-administration-permissions"),
+    path("api/v1/administracion/usuarios/<uuid:user_id>/", UserAdministrationUserView.as_view(), name="api-user-administration-user"),
+    path("api/v1/administracion/usuarios/<uuid:user_id>/restablecer-clave/", UserAdministrationPasswordResetView.as_view(), name="api-user-administration-password-reset"),
+    path("api/v1/administracion/usuarios/<uuid:user_id>/clave-temporal/", UserAdministrationTemporaryPasswordView.as_view(), name="api-user-administration-temporary-password"),
+    path("api/v1/administracion/usuarios/<uuid:user_id>/invitacion/", UserAdministrationResendInvitationView.as_view(), name="api-user-administration-resend-invitation"),
+    path("api/v1/administracion/usuarios/<uuid:user_id>/eliminacion/", UserAdministrationDeleteView.as_view(), name="api-user-administration-delete"),
     path("api/v1/conciliaciones-directas/trabajos/", DirectReconciliationListCreateView.as_view(), name="api-direct-reconciliation-list-create"),
     path("api/v1/conciliaciones-directas/trabajos/<uuid:job_id>/", DirectReconciliationDetailView.as_view(), name="api-direct-reconciliation-detail"),
     path("api/v1/conciliaciones-directas/trabajos/<uuid:job_id>/reporte/", DirectReconciliationReportView.as_view(), name="api-direct-reconciliation-report"),
+    path("api/v1/conciliaciones-directas/trabajos/<uuid:job_id>/archivos/<str:filename>/", DirectReconciliationSourceView.as_view(), name="api-direct-reconciliation-source"),
     path("api/v1/bancos/", BankListCreateView.as_view(), name="api-banks"),
     path("api/v1/bancos/<uuid:bank_id>/", BankDetailView.as_view(), name="api-bank-detail"),
     path("api/v1/cuentas/", AccountListCreateView.as_view(), name="api-accounts"),

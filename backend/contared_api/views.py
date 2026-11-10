@@ -24,4 +24,9 @@ class ApiStatusView(APIView):
 
 class SessionView(APIView):
     def get(self, request):
-        return Response(load_session_access(request.user.auth_user_id))
+        return Response(
+            load_session_access(
+                request.user.auth_user_id,
+                allow_password_change=True,
+            )
+        )

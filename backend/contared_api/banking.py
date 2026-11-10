@@ -326,7 +326,7 @@ class AccountListCreateView(APIView):
                     cursor.execute(f"SELECT COUNT(*) FROM contared.cuentas_bancarias c JOIN contared.bancos b ON b.id=c.banco_id WHERE {where}", params)
                     total = cursor.fetchone()[0]
                     cursor.execute(
-                        f"SELECT c.id::text,c.banco_id::text,b.nombre,c.alias,c.numero,c.moneda_codigo,c.activa,b.activo,c.codigo_contable FROM contared.cuentas_bancarias c JOIN contared.bancos b ON b.id=c.banco_id WHERE {where} ORDER BY b.nombre,c.alias LIMIT %s OFFSET %s",
+                        f"SELECT c.id::text,c.banco_id::text,b.nombre,c.alias,c.numero,c.moneda_codigo,c.activa,b.activo,c.codigo_contable,c.numero_terminacion,c.numero_completo_verificado,c.incorporacion_provisional FROM contared.cuentas_bancarias c JOIN contared.bancos b ON b.id=c.banco_id WHERE {where} ORDER BY b.nombre,c.alias LIMIT %s OFFSET %s",
                         params + [page_size, (page - 1) * page_size],
                     )
                     rows = cursor.fetchall()
@@ -337,6 +337,9 @@ class AccountListCreateView(APIView):
                 "id": row[0], "banco_id": row[1], "banco": row[2], "alias": row[3], "numero": row[4],
                 "moneda_codigo": row[5], "activa": row[6], "banco_activo": row[7],
                 "codigo_contable": row[8],
+                "numero_terminacion": row[9], "numero_completo_verificado": row[10],
+                "incorporacion_provisional": row[11],
+                "numero_completo": row[4] if row[10] else None,
             } for row in rows]
 
         existing_numbers = {str(item["numero"]).strip() for item in operational_results}
@@ -374,6 +377,8 @@ class AccountListCreateView(APIView):
                                 "moneda_codigo": moneda or "Pendiente", "activa": False,
                                 "banco_activo": True, "codigo_contable": None,
                                 "pendiente_configuracion": moneda is None,
+                                "numero_terminacion": None, "numero_completo_verificado": True,
+                                "incorporacion_provisional": False,
                             })
                 else:
                     cursor.execute("SELECT to_regclass('contared.catalogo_cuentas_sv')")
@@ -403,6 +408,8 @@ class AccountListCreateView(APIView):
                                 "numero_completo": None, "moneda_codigo": moneda or "Pendiente",
                                 "activa": False, "banco_activo": True, "codigo_contable": None,
                                 "pendiente_configuracion": not bool(confirmado) or moneda in (None, "", "Pendiente"),
+                                "numero_terminacion": terminacion, "numero_completo_verificado": False,
+                                "incorporacion_provisional": True,
                             })
         except DatabaseError:
             catalog_results = []

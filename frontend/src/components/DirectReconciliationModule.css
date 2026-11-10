@@ -37,8 +37,74 @@
 .table-scroll th, .table-scroll td { border-bottom: 1px solid #edf0f2; padding: 9px 8px; text-align: left; vertical-align: top; }
 .diagnostics { border-left: 3px solid #d6a800; padding-left: 10px; }
 .cheque-cut + .cheque-cut { margin-top: 16px; }
+.account-selection { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.account-selection > div { display: grid; gap: 4px; }
+.account-selection h2 { margin: 0 0 4px; font-size: 15px; }
+.account-selection span, .account-selection small { color: #667085; }
+.account-selection strong { color: var(--contared-text); }
+.account-modal-backdrop, .difference-modal-backdrop {
+  position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center;
+  padding: 20px; background: rgb(17 24 39 / 48%);
+}
+.account-modal, .difference-modal {
+  width: min(680px, 100%); max-height: min(86vh, 900px); overflow: auto;
+  border: 1px solid var(--contared-border); border-radius: 14px; background: #fff;
+  padding: 22px; box-shadow: 0 18px 60px rgb(17 24 39 / 24%);
+}
+.account-modal > header, .difference-modal > header {
+  display: flex; justify-content: space-between; align-items: flex-start; gap: 16px;
+  margin-bottom: 16px;
+}
+.account-modal h2, .difference-modal h2 { margin: 3px 0 0; }
+.account-search { display: grid; gap: 6px; color: #475467; font-size: 13px; }
+.account-search input { width: 100%; padding: 10px 12px; border: 1px solid var(--contared-border); border-radius: 8px; }
+.account-options { display: grid; gap: 8px; list-style: none; margin: 14px 0 0; padding: 0; }
+.account-options > li { border: 1px solid var(--contared-border); border-radius: 9px; overflow: hidden; }
+.account-options .empty-copy { padding: 12px; }
+.account-option { display: grid; width: 100%; gap: 5px; padding: 12px; border: 0; background: #fff; text-align: left; }
+.account-option:hover, .account-option.selected { background: #fff7f7; }
+.account-option.selected { box-shadow: inset 3px 0 var(--contared-red-dark); }
+.account-option span, .account-option small { color: #667085; }
+.account-link-suggestion { display: flex; align-items: center; justify-content: space-between; gap: 14px; border-left: 4px solid #d6a800; }
+.account-link-suggestion p { margin: 6px 0 0; color: #475467; }
+.residual-title { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.detail-button { padding: 3px 6px; border: 0; background: transparent; color: var(--contared-red-dark); font-size: 12px; text-decoration: underline; }
+.difference-modal { width: min(1040px, 100%); }
+.difference-section { margin: 18px 0; padding-top: 16px; border-top: 1px solid var(--contared-border); }
+.difference-section h3 { margin: 0 0 10px; font-size: 16px; }
+.difference-section h4 { margin: 12px 0 8px; font-size: 14px; }
+.difference-equation { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; }
+.difference-equation > span { display: grid; gap: 3px; }
+.difference-equation strong { font-variant-numeric: tabular-nums; }
+.difference-table-scroll { max-width: 100%; overflow: auto; margin: 8px 0; border: 1px solid var(--contared-border); border-radius: 8px; }
+.difference-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.difference-table th, .difference-table td { min-width: 92px; padding: 9px; border-bottom: 1px solid var(--contared-border); text-align: left; vertical-align: top; }
+.difference-table th { position: sticky; top: 0; background: var(--contared-red-dark); color: #fff; white-space: nowrap; }
+.difference-table td.money { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.difference-pending-side + .difference-pending-side { margin-top: 14px; }
+.difference-note, .difference-coverage { padding: 10px; background: #f9fafb; border-radius: 8px; color: #475467; }
+.difference-coverage { display: grid; gap: 5px; overflow-wrap: anywhere; font-size: 12px; }
+.difference-coverage > div { display: grid; gap: 3px; padding: 8px 0; border-top: 1px solid var(--contared-border); }
+.difference-opening-evidence { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin: 10px 0; }
+.difference-opening-evidence > div { display: grid; justify-items: start; gap: 4px; padding: 10px; border: 1px solid var(--contared-border); border-radius: 8px; }
+.difference-date-groups { display: grid; gap: 8px; margin: 8px 0; }
+.difference-date-group { border: 1px solid var(--contared-border); border-radius: 8px; padding: 9px 10px; }
+.difference-date-group > summary { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; cursor: pointer; }
+.difference-date-group > summary span:last-child { margin-left: auto; color: var(--contared-red-dark); }
+.difference-reversals { margin-top: 12px; }
+.difference-candidates article { padding: 10px 0; border-top: 1px solid var(--contared-border); }
+.difference-candidates p { margin: 5px 0; }
+.difference-candidates ul { padding-left: 20px; }
+.difference-candidates li { margin: 5px 0; }
+.difference-undetermined { padding: 12px; border-left: 4px solid #d6a800; background: #fffbeb; }
+.source-button { margin-top: 6px; padding: 3px 0; font-size: 12px; }
+@media (max-width: 700px) {
+  .account-selection, .account-link-suggestion { align-items: stretch; flex-direction: column; }
+  .account-modal-backdrop, .difference-modal-backdrop { padding: 10px; }
+  .account-modal, .difference-modal { padding: 16px; max-height: 92vh; }
+}
 @media print {
-  .sidebar, .topbar, .document-actions, .drop-zone, .analyze-button, .direct-header button { display: none !important; }
+  .sidebar, .topbar, .document-actions, .drop-zone, .analyze-button, .direct-header button, .account-selection, .account-modal-backdrop, .difference-modal-backdrop { display: none !important; }
   .main-column { margin: 0 !important; width: 100% !important; }
   .content-area { padding: 0 !important; }
 }
