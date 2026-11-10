@@ -159,6 +159,7 @@ def parse_date(value, date_format=None, field_name="fecha"):
     text = value.strip()
     formats = [date_format] if date_format else ["%Y-%m-%d", "%Y/%m/%d"]
     if date_format:
+        formats.extend((f"{date_format} %H:%M:%S", f"{date_format} %H:%M"))
         separator_alternative = date_format.replace("/", "-") if "/" in date_format else date_format.replace("-", "/")
         if separator_alternative != date_format:
             formats.append(separator_alternative)
@@ -208,12 +209,22 @@ def _normalize_xls(source_path, target_path):
         source = xlrd.open_workbook(str(source_path), on_demand=True)
         if source.nsheets > MAX_SHEETS:
             raise ValidationError({"archivo": "El libro supera el límite de hojas permitido."})
+        headerless_cuscatlan = False
         converted = Workbook(write_only=False)
         converted.remove(converted.active)
         for source_sheet in source.sheets():
             if source_sheet.ncols > MAX_COLUMNS or source_sheet.nrows > MAX_DATA_ROWS + 100:
                 raise ValidationError({"archivo": "Una hoja supera los límites de filas o columnas permitidos."})
             target_sheet = converted.create_sheet(source_sheet.name[:31] or "Hoja")
+            sheet_headerless_cuscatlan = _is_cuscatlan_headerless_sheet(
+                source_path, source_sheet, source.datemode
+            )
+            headerless_cuscatlan = headerless_cuscatlan or sheet_headerless_cuscatlan
+            if sheet_headerless_cuscatlan:
+                target_sheet.append([
+                    "Fecha Transacción", "Oficina", "Referencia", "Transacción",
+                    "Deb./Cred.", "Valor", "Saldo Real", "Saldo Disponible",
+                ])
             for row_index in range(source_sheet.nrows):
                 for column_index in range(source_sheet.ncols):
                     cell = source_sheet.cell(row_index, column_index)
@@ -224,7 +235,10 @@ def _normalize_xls(source_path, target_path):
                         value = f"#ERROR:{xlrd.error_text_from_code.get(value, 'unknown')}"
                     elif cell.ctype == xlrd.XL_CELL_EMPTY:
                         value = None
-                    target = target_sheet.cell(row=row_index + 1, column=column_index + 1)
+                    target = target_sheet.cell(
+                        row=row_index + (2 if sheet_headerless_cuscatlan else 1),
+                        column=column_index + 1,
+                    )
                     target.value = value
                     if cell.xf_index is not None and cell.xf_index < len(source.xf_list):
                         format_key = source.xf_list[cell.xf_index].format_key
@@ -233,6 +247,7 @@ def _normalize_xls(source_path, target_path):
                             target.number_format = cell_format.format_str
             target_sheet.sheet_view.showGridLines = True
         converted.save(target_path)
+        return headerless_cuscatlan
     except ValidationError:
         raise
     except Exception as exc:
@@ -244,6 +259,59 @@ def _normalize_xls(source_path, target_path):
             source.release_resources()
 
 
+def _is_cuscatlan_headerless_sheet(source_path, sheet, datemode):
+    filename = Path(source_path).name.casefold()
+    digits = re.sub(r"\D", "", re.sub(r"\(\d+\)", "", filename))
+    if "cusca" not in filename and "cuscatlan" not in filename and not digits.endswith("2509"):
+        return False
+    if sheet.ncols != 8 or sheet.nrows < 2:
+        return False
+
+    def valid_date(cell):
+        if cell.ctype == xlrd.XL_CELL_DATE:
+            try:
+                xlrd.xldate.xldate_as_datetime(cell.value, datemode)
+                return True
+            except (OverflowError, TypeError, ValueError):
+                return False
+        if cell.ctype == xlrd.XL_CELL_TEXT:
+            return any(
+                _try_parse_date(cell.value, fmt)
+                for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d")
+            )
+        return False
+
+    def valid_number(cell):
+        try:
+            return parse_decimal(cell.value, "valor") is not None
+        except ValueError:
+            return False
+
+    for row_index in range(min(sheet.nrows, 5)):
+        cells = [sheet.cell(row_index, col) for col in range(8)]
+        if (
+            valid_date(cells[0])
+            and cells[1].ctype == xlrd.XL_CELL_TEXT and str(cells[1].value).strip()
+            and cells[2].ctype in (xlrd.XL_CELL_TEXT, xlrd.XL_CELL_NUMBER)
+            and str(cells[2].value).strip()
+            and cells[3].ctype == xlrd.XL_CELL_TEXT and str(cells[3].value).strip()
+            and str(cells[4].value).strip() in ("+", "-", "D", "C", "DEBITO", "CREDITO")
+            and valid_number(cells[5])
+            and valid_number(cells[6])
+            and valid_number(cells[7])
+        ):
+            return True
+    return False
+
+
+def _try_parse_date(value, date_format):
+    try:
+        datetime.strptime(str(value).strip(), date_format)
+        return True
+    except ValueError:
+        return False
+
+
 def _normalized_header(value):
     text = unicodedata.normalize("NFKD", str(value or ""))
     text = "".join(character for character in text if not unicodedata.combining(character))
@@ -251,25 +319,58 @@ def _normalized_header(value):
 
 
 HEADER_ALIASES = {
-    "fecha": ("fecha de contabilizacion", "fecha valor", "fecha", "date", "posting date"),
+    "fecha": ("fecha de contabilizacion", "fecha valor", "fecha transaccion", "fecha", "date", "posting date"),
     "referencia": ("referencia 1", "referencia", "no doc", "numero de documento", "reference", "ref"),
-    "descripcion": ("info detallada", "descripci髇", "descripcion", "concepto", "detalle", "description", "narrative"),
+    "descripcion": ("info detallada", "transaccion", "descripci髇", "descripcion", "concepto", "detalle", "description", "narrative"),
     "numero_transaccion": ("n trans", "no trans", "numero transaccion", "transaccion", "transaction id"),
     "numero_cheque": ("numero cheque", "no cheque", "cheque", "check number"),
     "codigo_tt": ("codigo tt", "tt", "tipo transaccion", "codigo", "origen", "transaction code"),
-    "monto": ("monto firmado", "amount", "importe"),
-    "saldo_origen": ("saldo acumulado ml", "saldo acumulado", "saldo gtq", "saldo qtz", "balance", "saldo", "balance*"),
-    "salida": ("debe", "debe gtq", "debe qtz", "cargo ml", "cargo", "debito", "debit"),
-    "entrada": ("haber", "haber gtq", "haber qtz", "abono ml", "abono", "credito", "credit"),
+    "monto": ("monto firmado", "amount", "importe", "valor"),
+    "saldo_origen": ("saldo real", "saldo acumulado ml", "saldo acumulado", "saldo gtq", "saldo qtz", "balance", "saldo", "balance*"),
+    "salida": ("debe", "debe gtq", "debe qtz", "cargo ml", "cargo", "debito", "debitos", "debit"),
+    "entrada": ("haber", "haber gtq", "haber qtz", "abono ml", "abono", "credito", "creditos", "credit"),
+    "signo_monto": ("deb cred", "debito credito", "debe haber"),
 }
 
 
+def _gt_bank_layout(headers):
+    normalized = [_normalized_header(value) for value in headers]
+    if normalized[:8] == [
+        "", "fecha", "referencia", "descripcion", "debito", "credito", "saldo", "agencia",
+    ]:
+        return "banco_gt_gyt", {"fecha": 2, "referencia": 3, "descripcion": 4,
+                                "salida": 5, "entrada": 6, "saldo_origen": 7}
+    if (
+        normalized[:6] in (
+            ["fecha", "oficina", "descripcion", "referencia", "secuencial", "cheque propio local efectivo"],
+            ["fecha", "oficina", "descripci n", "referencia", "secuencial", "cheque propio local efectivo"],
+        )
+        and normalized[6:8] in (["debito", "credito"], ["d bito", "cr dito"])
+        and normalized[8:10] == ["saldo contable", "saldo disponible"]
+    ):
+        return "banco_gt_banrural", {"fecha": 1, "descripcion": 3, "referencia": 4,
+                                     "numero_transaccion": 5, "salida": 7, "entrada": 8, "saldo_origen": 9}
+    if normalized[:7] in (
+        ["fecha de transaccion", "referencia de transaccion", "codigo de transaccion",
+         "descripcion de transaccion", "debito de transaccion", "credito de transaccion", "balance de transaccion"],
+        ["fecha de transacci", "referencia de transacci", "c igo de transacci",
+         "descripci de transacci", "d ito de transacci", "cr ito de transacci", "balance de transacci"],
+    ):
+        return "banco_gt_bac", {"fecha": 1, "referencia": 2, "codigo_tt": 3, "descripcion": 4,
+                                 "salida": 5, "entrada": 6, "saldo_origen": 7}
+    return None, {}
+
+
 def _suggest_mapping(headers, origin):
+    if origin == "banco":
+        _, bank_mapping = _gt_bank_layout(headers)
+        if bank_mapping:
+            return bank_mapping
     normalized = [_normalized_header(header) for header in headers]
     mapping = {}
     used = set()
     for field in ("fecha", "referencia", "descripcion", "numero_transaccion",
-                  "numero_cheque", "codigo_tt", "saldo_origen"):
+                  "numero_cheque", "codigo_tt", "saldo_origen", "signo_monto"):
         for alias in HEADER_ALIASES[field]:
             index = next(
                 (index for index, header in enumerate(normalized)
@@ -396,12 +497,13 @@ def _read_workbook_context(sheet, headers, mapping, origin):
         else None
     )
     bank_match = re.search(
-        r"\b(Banco\s+Industrial|Banco\s+Agr[ií]cola|Promerica|BAC)\b",
+        r"\b(Banco\s+Industrial|Banco\s+Agr[ií]cola|Banco\s+Cusc?atl[aá]n|Promerica|BAC)\b",
         text,
         re.IGNORECASE,
     )
     bank_name = bank_match.group(1) if bank_match else None
     opening_balance = None
+    opening_balance_evidence = None
     opening_match = re.search(
         r"(?:saldo|balance)\s+inicial(?:\s*\([^)]*\))?\s*:\s*"
         r"([-+]?\d[\d.,]*)",
@@ -413,6 +515,14 @@ def _read_workbook_context(sheet, headers, mapping, origin):
             opening_balance = format(parse_decimal(opening_match.group(1), "saldo inicial"), "f")
         except ValueError:
             pass
+
+    def row_date(row):
+        if "fecha" not in mapping:
+            return None
+        try:
+            return parse_date(row[int(mapping["fecha"]) - 1], "%d/%m/%Y", "fecha").isoformat()
+        except ValueError:
+            return None
 
     normalized_headers = [_normalized_header(value) for value in headers]
     account_code_index = next((
@@ -437,16 +547,63 @@ def _read_workbook_context(sheet, headers, mapping, origin):
     if opening_balance is None and "saldo_origen" in mapping and "codigo_tt" in mapping:
         balance_index = int(mapping["saldo_origen"]) - 1
         code_index = int(mapping["codigo_tt"]) - 1
-        for row in sheet.iter_rows(min_row=2, max_row=min(sheet.max_row or 20, 20), values_only=True):
+        for row_number, row in enumerate(
+            sheet.iter_rows(min_row=2, max_row=min(sheet.max_row or 20, 20), values_only=True),
+            start=2,
+        ):
             if code_index < len(row) and str(row[code_index] or "").strip().casefold() in ("si", "saldo inicial"):
                 if balance_index < len(row):
                     try:
                         value = parse_decimal(row[balance_index], "saldo inicial")
                         opening_balance = format(value, "f") if value is not None else None
+                        opening_balance_evidence = {
+                            "hoja": sheet.title,
+                            "fila": row_number,
+                            "fecha": row_date(row),
+                        }
+                    except ValueError:
+                        pass
+                break
+    if opening_balance is None and "saldo_origen" in mapping:
+        balance_index = int(mapping["saldo_origen"]) - 1
+        label_indexes = [
+            int(mapping[field]) - 1
+            for field in ("descripcion", "codigo_tt")
+            if field in mapping
+        ]
+        if label_indexes:
+            for row_number, row in enumerate(
+                sheet.iter_rows(min_row=2, max_row=min(sheet.max_row or 20, 20), values_only=True),
+                start=2,
+            ):
+                if not any(
+                    index < len(row)
+                    and _normalized_header(row[index]) in (
+                        "si", "saldo inicial", "saldo inicial del periodo",
+                        "saldo inicial del mes",
+                    )
+                    for index in label_indexes
+                ):
+                    continue
+                if balance_index < len(row):
+                    try:
+                        value = parse_decimal(row[balance_index], "saldo inicial")
+                        opening_balance = format(value, "f") if value is not None else None
+                        opening_balance_evidence = {
+                            "hoja": sheet.title,
+                            "fila": row_number,
+                            "fecha": row_date(row),
+                        }
                     except ValueError:
                         pass
                 break
 
+    normalized_headers = [_normalized_header(value) for value in headers]
+    cuscatlan_profile = {
+        "fecha transaccion", "oficina", "referencia", "transaccion",
+        "deb cred", "valor", "saldo real", "saldo disponible",
+    } <= set(normalized_headers)
+    coverage_type = "declarada" if range_match and coverage else "inferida" if coverage else None
     return {
         "cuenta_bancaria": account_number,
         "terminacion": termination,
@@ -456,8 +613,15 @@ def _read_workbook_context(sheet, headers, mapping, origin):
         "moneda_codigo": currency,
         "periodo_declarado": declared_period,
         "cobertura_declarada": coverage,
+        "tipo_cobertura": coverage_type,
         "saldo_inicial": opening_balance,
+        "saldo_inicial_evidencia": opening_balance_evidence,
         "tipo_identificador_cuenta": "codigo_contable" if origin == "libros" else "cuenta_bancaria",
+        **({
+            "banco": bank_name or "Banco Cuscatlán",
+            "pais_codigo": "SV",
+            "moneda_codigo": currency or "USD",
+        } if cuscatlan_profile else {}),
     }
 
 
@@ -536,11 +700,37 @@ def recognize_workbook(path, *, requested_origin=None):
             mapping,
             origin,
         )
+        gt_profile, _ = _gt_bank_layout(headers) if origin == "banco" else (None, {})
+        if gt_profile == "banco_gt_bac":
+            metadata = list(context_workbook[sheet_name].iter_rows(max_row=2, values_only=True))
+            if len(metadata) == 2 and [_normalized_header(value) for value in metadata[0][2:5]] == [
+                "producto", "moneda", "saldo inicial",
+            ]:
+                account, currency, opening_balance = metadata[1][2:5]
+                account = str(account or "").strip()
+                if re.fullmatch(r"[0-9]{5,}", account):
+                    context["cuenta_bancaria"] = account
+                    context["terminacion"] = account[-4:]
+                if _normalized_header(currency) in ("gtq", "qtz"):
+                    context.update({"banco": "BAC", "pais_codigo": "GT", "moneda_codigo": "GTQ"})
+                try:
+                    opening_amount = parse_decimal(opening_balance, "saldo inicial")
+                except ValueError:
+                    opening_amount = None
+                if opening_amount is not None:
+                    context["saldo_inicial"] = format(opening_amount, "f")
+                    context["saldo_inicial_evidencia"] = {"hoja": sheet_name, "fila": 2, "fecha": None}
     finally:
         context_workbook.close()
-    profile = (
+    normalized_headers = {_normalized_header(value) for value in headers}
+    profile = gt_profile or (
         "banco_industrial_libros"
         if origin == "libros" and "saldo acumulado ml" in [_normalized_header(value) for value in headers]
+        else "banco_cuscatlan_movimientos"
+        if origin == "banco" and {
+            "fecha transaccion", "oficina", "referencia", "transaccion",
+            "deb cred", "valor", "saldo real", "saldo disponible",
+        } <= normalized_headers
         else "banco_extracto_debe_haber"
         if origin == "banco" and {"salida", "entrada"} <= mapping.keys()
         else "generico_monto_firmado"
@@ -679,6 +869,7 @@ def _resolve_mapping(headers, mapping, origin):
         "salidas": "salida",
         "entrada": "entrada",
         "entradas": "entrada",
+        "signo_monto": "signo_monto",
     }
     if not isinstance(mapping, dict):
         raise ValidationError({"mapping": "mapping debe ser un objeto de nombres de campo a columna."})
@@ -868,6 +1059,10 @@ def validate_workbook(
         if not any(headers):
             raise ValidationError({"header_row": "La fila seleccionada está vacía."})
         indexes = _resolve_mapping(headers, mapping, origin)
+        gt_profile, gt_mapping = _gt_bank_layout(headers) if origin == "banco" else (None, {})
+        signed_debits = gt_profile == "banco_gt_gyt" and all(
+            indexes.get(field) == column - 1 for field, column in gt_mapping.items()
+        )
         if date_format is not None and (not isinstance(date_format, str) or len(date_format) > 50):
             raise ValidationError({"date_format": "date_format no es válido."})
         date_proposals = _bi_statement_date_proposals(
@@ -1067,14 +1262,35 @@ def validate_workbook(
             try:
                 if "monto" in indexes:
                     amount = parse_decimal(values[indexes["monto"]], "monto")
+                    if "signo_monto" in indexes:
+                        direction = str(values[indexes["signo_monto"]] or "").strip().upper()
+                        if direction not in ("+", "-", "D", "C", "DEBITO", "CREDITO"):
+                            raise ValueError("signo_monto: use + o - para identificar el crédito o débito.")
+                        if amount is None or amount < 0:
+                            raise ValueError("monto: use el valor absoluto junto al signo del movimiento.")
+                        if direction in ("-", "D", "DEBITO"):
+                            amount = -amount
                 elif origin == "banco":
                     outbound = parse_decimal(values[indexes["salida"]], "salida") or Decimal(0)
                     inbound = parse_decimal(values[indexes["entrada"]], "entrada") or Decimal(0)
+                    if signed_debits:
+                        outbound = abs(outbound)
                     if outbound < 0 or inbound < 0:
                         raise ValueError("salida y entrada deben contener magnitudes positivas.")
                     if outbound and inbound:
                         raise ValueError("La fila tiene salida y entrada; indique solo una dirección.")
                     amount = inbound - outbound
+                    if (
+                        gt_profile == "banco_gt_banrural"
+                        and amount == 0
+                        and _normalized_header(values_out.get("descripcion")) == "liberacion manual de reservas"
+                    ):
+                        advertencias.append({
+                            "fila": row_number,
+                            "campo": "monto",
+                            "mensaje": "Liberación de reservas sin débito ni crédito; no se importa como movimiento contable.",
+                        })
+                        continue
                 else:
                     amount = None
                 if amount is None or amount == 0:

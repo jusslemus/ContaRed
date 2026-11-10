@@ -784,7 +784,7 @@ class SessionAuthorizationTests(SimpleTestCase):
 
     def test_session_returns_only_active_authorized_company_country_roles(self):
         cursor = FakeSessionCursor(
-            profile=(INTERNAL_USER_ID, "Administradora", True),
+            profile=(INTERNAL_USER_ID, "Administradora", True, False),
             accesses=[
                 ("company-sv", "Empresa SV", "SV", "El Salvador", "administrador"),
                 ("company-gt", "Empresa GT", "GT", "Guatemala", "administrador"),
@@ -798,6 +798,7 @@ class SessionAuthorizationTests(SimpleTestCase):
             response.data,
             {
                 "usuario": {"id": INTERNAL_USER_ID, "nombre": "Administradora"},
+                "cambio_clave_obligatorio": False,
                 "accesos": [
                     {
                         "empresa_id": "company-sv",
@@ -832,7 +833,7 @@ class SessionAuthorizationTests(SimpleTestCase):
         self,
     ):
         cursor = FakeSessionCursor(
-            profile=(INTERNAL_USER_ID, "Auxiliar", True),
+            profile=(INTERNAL_USER_ID, "Auxiliar", True, False),
             accesses=[
                 ("company-sv", "Empresa SV", "SV", "El Salvador", "auxiliar"),
             ],
@@ -875,7 +876,7 @@ class SessionAuthorizationTests(SimpleTestCase):
 
     def test_session_rejects_inactive_profile_without_querying_accesses(self):
         cursor = FakeSessionCursor(
-            profile=(INTERNAL_USER_ID, "Administradora", False),
+            profile=(INTERNAL_USER_ID, "Administradora", False, False),
         )
 
         self.assert_session_forbidden(cursor, "profile_inactive")
@@ -883,7 +884,7 @@ class SessionAuthorizationTests(SimpleTestCase):
 
     def test_session_rejects_profile_without_active_authorizations(self):
         cursor = FakeSessionCursor(
-            profile=(INTERNAL_USER_ID, "Administradora", True),
+            profile=(INTERNAL_USER_ID, "Administradora", True, False),
             accesses=[],
         )
 

@@ -104,12 +104,27 @@ Completa `backend/.env` con:
 
 - `DJANGO_SECRET_KEY`, `DJANGO_DEBUG`, `DJANGO_ALLOWED_HOSTS` y `CORS_ALLOWED_ORIGINS`.
 - `SUPABASE_URL`, `SUPABASE_ISSUER`, `SUPABASE_JWKS_URL` y `SUPABASE_PUBLISHABLE_KEY`.
-- `SUPABASE_SERVICE_ROLE_KEY` solo en el backend para subir y limpiar originales en el bucket privado `contared-documentos`. Esta credencial privilegiada no debe estar en el frontend ni en logs. Sin configurarla, las vistas previas funcionan, pero no se pueden confirmar cargas.
+- `SUPABASE_SERVICE_ROLE_KEY` solo en el backend para crear identidades, asignar contraseñas mediante la API administrativa oficial de Auth y administrar el bucket privado `contared-documentos`. Esta credencial no debe estar en el frontend ni en logs.
+- `SUPABASE_AUTH_REDIRECT_URL`: URL de regreso para el flujo opcional de recuperación de contraseña. No se usa para crear cuentas ni para el cambio obligatorio de contraseña inicial.
 - `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` y `POSTGRES_SSLMODE`.
 
 Las credenciales de PostgreSQL permanecen solo en el backend. La conexión configura `search_path=contared`; Django no tiene modelos de dominio ni migraciones para ese esquema. No ejecutes `manage.py migrate` contra Supabase. `/api/v1/status/` comprueba la conexión con un `SELECT 1`. `/api/v1/session/` usa una transacción PostgreSQL `READ ONLY` y consultas calificadas al esquema existente; no escribe ni cambia permisos.
 
-La API devuelve solamente `usuario`, `accesos` y `paises` autorizados. Cada acceso asocia empresa, código/nombre de país y rol. Los fallos diferenciados incluyen perfil no vinculado (`profile_not_found`), perfil inactivo (`profile_inactive`), falta de accesos (`no_access`), proveedor de identidad no disponible y base no disponible. El selector de frontend no otorga permisos; la autorización se resuelve en servidor.
+La API devuelve solamente `usuario`, `accesos`, `paises` autorizados y el indicador `cambio_clave_obligatorio`. Cada acceso asocia empresa, código/nombre de país y rol. Una cuenta que debe cambiar la contraseña solo puede consultar su sesión y completar ese cambio; el backend bloquea las demás operaciones. El servidor valida la contraseña temporal con Supabase Auth, confirma la actualización mediante Auth Admin y solo después retira el indicador. El selector de frontend no otorga permisos; la autorización se resuelve en servidor.
+
+### Administración de usuarios
+
+La pantalla solo aparece para personas con rol `administrador`. Los accesos nuevos se limitan a empresas y países donde ese administrador tiene un acceso activo con ese rol. La desactivación es por acceso, no por perfil global, y las filas se conservan; el servidor impide retirar al último administrador activo de cada empresa/país y audita cambios con el actor autenticado. Editar nombre y correo requiere que todos los accesos del usuario estén dentro del ámbito administrado; si tiene accesos externos, solo se permite editar los accesos autorizados.
+
+Antes de habilitar esta pantalla, aplica manualmente, en orden, `supabase/migrations/202611090001_administracion_usuarios.sql`, `supabase/migrations/202611100001_perfil_correo_pendiente.sql` y `supabase/migrations/202611100002_cambio_clave_obligatorio.sql` en el SQL Editor de Supabase. La primera agrega correo y estado de invitación a `contared.usuarios` y un estado independiente a `contared.accesos`; la segunda conserva por separado el correo pendiente de confirmación; la tercera agrega el indicador de cambio obligatorio, sin contraseñas. No crean identidades Auth ni cambian contraseñas o permisos existentes. No las ejecutes desde Django ni desde esta aplicación.
+
+**Crear usuario** crea la identidad con contraseña inicial y `email_confirm=true` mediante la API administrativa oficial de Supabase Auth. El primer ingreso requiere una contraseña diferente; ContaRed no guarda contraseñas en sus tablas y no crea filas directamente en `auth.users`. Los correos ya asociados a una identidad reutilizan el perfil y los accesos sin modificar la contraseña; la acción explícita **Asignar contraseña temporal** está limitada a perfiles cuyos accesos están dentro del ámbito del administrador. Un perfil heredado con invitación fallida se reutiliza: se completa su creación si no tiene identidad o se asigna una contraseña temporal si ya la tiene. Los fallos parciales conservan el perfil y evitan duplicar identidades al reintentar. Al editar, se conserva el correo vigente y se registra por separado un cambio pendiente si Supabase Auth requiere confirmación. La recuperación opcional envía un enlace al correo vigente usando Auth.
+
+Los fallos de Auth se registran por operación, estado HTTP, código y mensaje saneado del proveedor; nunca incluyen contraseñas, credenciales, correos, URLs, tokens ni identificadores. La creación directa no depende de correo de invitación.
+
+Los roles que se muestran en **Crear usuario** y **Editar usuario** reflejan la autorización del backend: administrador gestiona dentro de sus ámbitos; auxiliar y administrador pueden analizar y modificar conciliaciones; revisor y consulta son de lectura salvo las acciones de revisión existentes concedidas a revisor; la eliminación definitiva de conciliaciones corresponde solo al administrador.
+
+**Eliminar usuario** primero consulta el alcance autorizado. Retirar accesos solo desactiva los países seleccionados; no elimina perfiles ni registros históricos. El borrado definitivo se permite únicamente si el administrador controla todos los ámbitos, no es su propia cuenta, no quedan referencias por clave foránea y puede verificarse la identidad Auth vinculada o su ausencia. La identidad se elimina mediante la API administrativa oficial de Supabase Auth; si Auth se eliminó pero PostgreSQL no pudo confirmar la transacción, el modal informa el estado y el reintento trata la respuesta Auth `404` como ya completada. No se eliminan registros financieros ni se ejecutan migraciones automáticamente.
 
 Para iniciar el backend en desarrollo:
 
@@ -130,6 +145,8 @@ Backend, con el entorno virtual del repositorio y sin conexión a Supabase:
 ```
 
 El perfil de pruebas usa SQLite en memoria y mocks donde se inspeccionan consultas; no toma credenciales PostgreSQL ni conecta a Supabase. Incluye el caso sintético INTELPRUEBA de 12 movimientos de Banco y 13 de Libros, importes `Decimal`, ocho coincidencias directas (el cheque 000120 incluido una sola vez), grupo de 300 contra 180 + 120, depósito por fecha/monto aunque cambie la referencia, diferencia de 20, comisión solo en Banco y cheque 000121 solo en Libros. También cubre candidatos ambiguos, límites de agrupación, tipos de transacción configurados/desconocidos, importación, autorización de sesión, consulta de cheques por corte, clasificación/reintentos, entrega, cobro exacto, rechazo de montos ambiguos, anulación con soporte e historial.
+
+La administración de usuarios también prueba creación Auth confirmada, reutilización de perfiles y accesos pendientes, reintentos parciales sin duplicar identidades, permisos SV/GT, asignación temporal limitada al ámbito autorizado, bloqueo de operaciones hasta el primer cambio verificado y rechazo de reutilizar la contraseña temporal. Los tests usan únicamente credenciales y respuestas sintéticas; no modifican usuarios de Supabase.
 
 ### Verificar INTELPRUEBA desde la interfaz
 

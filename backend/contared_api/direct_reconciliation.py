@@ -2,34 +2,40 @@ import hashlib
 import json
 import re
 import shutil
+import unicodedata
+from zipfile import BadZipFile
 from calendar import monthrange
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
+from xml.etree.ElementTree import ParseError
+from xml.sax.saxutils import escape
 
 from django.conf import settings
-from django.db import connection
-from django.http import HttpResponse
+from django.db import DatabaseError, connection, transaction
+from django.http import FileResponse, HttpResponse
 from openpyxl import Workbook, load_workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.exceptions import InvalidFileException
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
 from reportlab.lib.utils import ImageReader
-from reportlab.platypus import Image, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import Image, KeepTogether, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from contared_api.banking import CUENTAS_GT_CONFIRMADAS, scope_from_request
+from contared_api.banking import CUENTAS_GT_CONFIRMADAS, CUENTAS_SV_CONFIRMADAS, scope_from_request
 from contared_api.imports import _normalize_xls, recognize_workbook, validate_workbook
 from contared_api.reconciliation import Movement, propose_reconciliation
+from contared_api.session_access import DatabaseUnavailable
 
 
 def _storage_root():
@@ -48,7 +54,7 @@ def _json_default(value):
 
 def _write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".tmp")
+    temporary = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, default=_json_default), encoding="utf-8")
     temporary.replace(path)
 
@@ -60,7 +66,11 @@ def _read_json(path):
 
 
 def _access(request):
-    scope = scope_from_request(request)
+    return scope_from_request(request)
+
+
+def _writer_access(request):
+    scope = _access(request)
     if scope["role"] not in ("administrador", "auxiliar"):
         raise PermissionDenied("Esta operación requiere el rol administrador o auxiliar.", code="writer_required")
     return scope
@@ -71,9 +81,23 @@ def _safe_scope_path(scope):
     return root / scope["country_code"] / scope["company_id"] / scope["user_id"]
 
 
+def _scope_jobs_path(scope):
+    return _storage_root() / scope["country_code"] / scope["company_id"]
+
+
 def _job_path(scope, job_id):
-    root = _safe_scope_path(scope)
-    return root / str(job_id)
+    root = _scope_jobs_path(scope)
+    for metadata in root.glob(f"*/{job_id}/metadata.json"):
+        try:
+            job = json.loads(metadata.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if (
+            job.get("empresa_id") == scope["company_id"]
+            and job.get("pais_codigo") == scope["country_code"]
+        ):
+            return metadata.parent
+    return _safe_scope_path(scope) / str(job_id)
 
 
 def _parse_decimal(value):
@@ -86,12 +110,478 @@ def _parse_decimal(value):
         return None
 
 
+def _account_digits(value):
+    return re.sub(r"\D", "", str(value or ""))
+
+
+def _bank_key(value):
+    text = unicodedata.normalize("NFKD", str(value or "").casefold())
+    text = "".join(character for character in text if not unicodedata.combining(character))
+    normalized = re.sub(r"[^a-z0-9]", "", text)
+    if "bac" in normalized or "americacentral" in normalized:
+        return "bac"
+    return normalized
+
+
+def _is_cuscatlan_account(account):
+    identity = f"{account.get('banco', '')} {account.get('alias', '')}".casefold()
+    return "cuscat" in identity or "cusca 2509" in identity
+
+
+def _period_dates(period):
+    if isinstance(period, date):
+        start = period.replace(day=1)
+    else:
+        match = re.fullmatch(r"(\d{4})-(\d{2})", str(period or "").strip())
+        if not match:
+            raise ValidationError({"periodo": "Selecciona un mes y año válidos para conciliar."})
+        try:
+            start = date(int(match.group(1)), int(match.group(2)), 1)
+        except ValueError as exc:
+            raise ValidationError({"periodo": "Selecciona un mes y año válidos para conciliar."}) from exc
+    end = date(start.year, start.month, monthrange(start.year, start.month)[1])
+    previous_end = start - timedelta(days=1)
+    previous_start = previous_end.replace(day=1)
+    return start, end, previous_start, previous_end
+
+
+def _resolve_cuscatlan_opening_balance(movements, recognition, period):
+    start, end, previous_start, previous_end = _period_dates(period)
+    previous_month = [
+        movement for movement in movements
+        if previous_start.isoformat() <= str(movement.get("fecha") or "") <= previous_end.isoformat()
+    ]
+    if previous_month:
+        latest_date = max(movement["fecha"] for movement in previous_month)
+        last_day_movements = sorted(
+            (movement for movement in previous_month if movement["fecha"] == latest_date),
+            key=lambda item: int(item.get("fila_origen") or 0),
+        )
+        sequence_verified = True
+        for earlier, later in zip(last_day_movements, last_day_movements[1:]):
+            earlier_balance = _parse_decimal(earlier.get("saldo_origen"))
+            later_balance = _parse_decimal(later.get("saldo_origen"))
+            later_amount = _parse_decimal(later.get("monto"))
+            if (
+                earlier_balance is None or later_balance is None or later_amount is None
+                or (earlier_balance + later_amount).quantize(Decimal("0.01"))
+                != later_balance.quantize(Decimal("0.01"))
+            ):
+                sequence_verified = False
+                break
+        latest = last_day_movements[-1]
+        balance = _parse_decimal(latest.get("saldo_origen")) if sequence_verified else None
+        if balance is not None:
+            source = latest.get("datos_originales") or {}
+            return {
+                "saldo": str(balance),
+                "fecha": latest.get("fecha"),
+                "archivo": source.get("archivo"),
+                "hoja": source.get("hoja"),
+                "fila": latest.get("fila_origen"),
+                "metodo": "ultimo_movimiento_mes_anterior",
+                "secuencia_verificada": True,
+            }, None
+        if len(last_day_movements) > 1:
+            return None, "No se pudo comprobar la secuencia de movimientos con la misma fecha; revise el orden y el Saldo Real."
+
+    context = recognition.get("contexto") or {}
+    if context.get("periodo_declarado") == start.strftime("%Y-%m") and context.get("saldo_inicial") is not None:
+        return {
+            **(context.get("saldo_inicial_evidencia") or {}),
+            "saldo": str(context["saldo_inicial"]),
+            "archivo": (context.get("saldo_inicial_evidencia") or {}).get("archivo"),
+            "hoja": (context.get("saldo_inicial_evidencia") or {}).get("hoja") or recognition.get("hoja"),
+            "metodo": "saldo_inicial_explicito",
+            "secuencia_verificada": True,
+        }, None
+    return None, "Falta el saldo inicial bancario. Descargue el estado con un rango que incluya el último movimiento del mes anterior"
+
+
+def _account_row(row):
+    return {
+        "id": row[0],
+        "banco_id": row[1],
+        "banco": row[2],
+        "numero": row[3],
+        "alias": row[4],
+        "moneda_codigo": row[5],
+        "numero_terminacion": row[6],
+        "numero_completo_verificado": row[7],
+        "incorporacion_provisional": row[8],
+    }
+
+
+def _authorized_account(cursor, scope, account_id):
+    cursor.execute(
+        """
+        SELECT c.id::text,c.banco_id::text,b.nombre,c.numero,c.alias,c.moneda_codigo,
+               c.numero_terminacion,c.numero_completo_verificado,c.incorporacion_provisional
+        FROM contared.cuentas_bancarias c
+        JOIN contared.bancos b ON b.id=c.banco_id
+        WHERE c.id=%s AND c.empresa_id=%s AND c.pais_codigo=%s
+          AND c.activa IS TRUE AND b.activo IS TRUE
+        """,
+        [account_id, scope["company_id"], scope["country_code"]],
+    )
+    row = cursor.fetchone()
+    if row is None:
+        raise ValidationError({
+            "cuenta_id": "La cuenta seleccionada no está activa o no pertenece a la empresa y país autorizados."
+        })
+    account = _account_row(row)
+    if not account["moneda_codigo"]:
+        raise ValidationError({"cuenta_id": "La cuenta seleccionada no tiene una moneda configurada."})
+    return account
+
+
+def _authorized_accounts(cursor, scope):
+    cursor.execute(
+        """
+        SELECT c.id::text,c.banco_id::text,b.nombre,c.numero,c.alias,c.moneda_codigo,
+               c.numero_terminacion,c.numero_completo_verificado,c.incorporacion_provisional
+        FROM contared.cuentas_bancarias c
+        JOIN contared.bancos b ON b.id=c.banco_id
+        WHERE c.empresa_id=%s AND c.pais_codigo=%s
+          AND c.activa IS TRUE AND b.activo IS TRUE
+        """,
+        [scope["company_id"], scope["country_code"]],
+    )
+    return [_account_row(row) for row in cursor.fetchall()]
+
+
+def _authorized_accounts_for_scope(scope):
+    try:
+        with connection.cursor() as cursor:
+            return _authorized_accounts(cursor, scope)
+    except DatabaseError as exc:
+        raise DatabaseUnavailable() from exc
+
+
+def _document_contexts(result, origin):
+    contexts = []
+    for document in result.get("archivos", []):
+        recognition = document.get("reconocimiento") or {}
+        if recognition.get("origen_sugerido") == origin:
+            context = recognition.get("contexto") or {}
+            if isinstance(context, dict):
+                contexts.append(context)
+    section = result.get("banco" if origin == "banco" else "libros") or {}
+    recognition = section.get("reconocimiento") or {}
+    section_context = recognition.get("contexto") or {}
+    if isinstance(section_context, dict) and section_context not in contexts:
+        contexts.append(section_context)
+    return contexts
+
+
+def _validate_account_result(account, available_accounts, result, country_code):
+    diagnostics = []
+    suggestion = None
+    expected_bank = _bank_key(account.get("banco"))
+    expected_currency = str(account.get("moneda_codigo") or "").strip().upper()
+    selected_number = _account_digits(account.get("numero"))
+    selected_ending = _account_digits(account.get("numero_terminacion")) or (
+        selected_number if len(selected_number) == 4 else selected_number[-4:]
+    )
+    bank_contexts = _document_contexts(result, "banco")
+    ledger_contexts = _document_contexts(result, "libros")
+    bank_identities = []
+
+    def report(code, message):
+        item = {"codigo": code, "mensaje": message}
+        if item not in diagnostics:
+            diagnostics.append(item)
+
+    for context in bank_contexts:
+        detected_bank = _bank_key(context.get("banco"))
+        detected_currency = str(context.get("moneda_codigo") or context.get("moneda") or "").strip().upper()
+        if detected_bank and expected_bank and detected_bank != expected_bank:
+            report("cuenta_banco_incompatible", "El banco identificado en el estado no coincide con la cuenta seleccionada.")
+        if detected_currency and expected_currency and detected_currency != expected_currency:
+            report("cuenta_moneda_incompatible", "La moneda identificada en el estado no coincide con la cuenta seleccionada.")
+
+        full_number = _account_digits(
+            context.get("cuenta_bancaria") or context.get("numero_cuenta") or context.get("cuenta")
+        )
+        ending = _account_digits(context.get("terminacion"))
+        if full_number:
+            if len(full_number) > 4:
+                bank_identities.append((detected_bank or expected_bank, detected_currency or expected_currency, full_number))
+            exact = selected_number == full_number
+            suffix_match = (
+                country_code == "SV"
+                and len(selected_ending) == 4
+                and full_number.endswith(selected_ending)
+            )
+            matching_accounts = [
+                candidate for candidate in available_accounts
+                if _bank_key(candidate.get("banco")) == (detected_bank or expected_bank)
+                and str(candidate.get("moneda_codigo") or "").strip().upper() == (detected_currency or expected_currency)
+                and (
+                    _account_digits(candidate.get("numero")) == full_number
+                    or (
+                        country_code == "SV"
+                        and len(_account_digits(candidate.get("numero_terminacion")) or _account_digits(candidate.get("numero"))) == 4
+                        and full_number.endswith(_account_digits(candidate.get("numero_terminacion")) or _account_digits(candidate.get("numero")))
+                    )
+                )
+            ]
+            if not (exact or suffix_match) or not matching_accounts or account["id"] not in {item["id"] for item in matching_accounts}:
+                report("cuenta_numero_incompatible", "El número completo del documento no coincide con la cuenta seleccionada.")
+            elif suffix_match and selected_number != full_number and len(matching_accounts) == 1:
+                suggestion = {
+                    "numero_completo": full_number,
+                    "terminacion": selected_ending,
+                    "cuenta_id": account["id"],
+                    "requiere_confirmacion": True,
+                }
+            elif len(matching_accounts) != 1:
+                report("cuenta_coincidencia_ambigua", "El número del documento coincide con más de una cuenta del mismo banco y moneda. Selecciona o vincula una cuenta única.")
+        elif ending:
+            if country_code != "SV":
+                report("cuenta_numero_incompatible", "El documento solo proporciona una terminación y no se puede validar con seguridad para este país.")
+                continue
+            if not detected_bank or not detected_currency:
+                report("cuenta_datos_insuficientes", "Para validar una terminación de cuenta se requieren banco y moneda identificados en el documento.")
+                continue
+            bank_identities.append((detected_bank, detected_currency, ending[-4:]))
+            matching_accounts = [
+                candidate for candidate in available_accounts
+                if _bank_key(candidate.get("banco")) == detected_bank
+                and str(candidate.get("moneda_codigo") or "").strip().upper() == detected_currency
+                and (_account_digits(candidate.get("numero_terminacion")) or _account_digits(candidate.get("numero"))).endswith(ending[-4:])
+            ]
+            if len(matching_accounts) != 1 or matching_accounts[0]["id"] != account["id"]:
+                report("cuenta_coincidencia_ambigua", "La terminación no identifica de forma única la cuenta seleccionada para ese banco y moneda.")
+
+    for context in ledger_contexts:
+        ledger_bank = _bank_key(context.get("banco"))
+        detected_currency = str(context.get("moneda_codigo") or context.get("moneda") or "").strip().upper()
+        if detected_currency and expected_currency and detected_currency != expected_currency:
+            report("cuenta_moneda_incompatible", "La moneda identificada en el mayor no coincide con la cuenta seleccionada.")
+        full_number = _account_digits(
+            context.get("cuenta_bancaria") or context.get("numero_cuenta") or context.get("cuenta")
+        )
+        ending = _account_digits(context.get("terminacion"))
+        if full_number:
+            exact = selected_number == full_number
+            suffix_match = country_code == "SV" and len(selected_ending) == 4 and full_number.endswith(selected_ending)
+            matching_accounts = [
+                candidate for candidate in available_accounts
+                if _bank_key(candidate.get("banco")) == (ledger_bank or expected_bank)
+                and str(candidate.get("moneda_codigo") or "").strip().upper() == (detected_currency or expected_currency)
+                and (
+                    _account_digits(candidate.get("numero")) == full_number
+                    or (
+                        country_code == "SV"
+                        and len(_account_digits(candidate.get("numero_terminacion")) or _account_digits(candidate.get("numero"))) == 4
+                        and full_number.endswith(_account_digits(candidate.get("numero_terminacion")) or _account_digits(candidate.get("numero")))
+                    )
+                )
+            ]
+            if not (exact or suffix_match) or not matching_accounts or account["id"] not in {item["id"] for item in matching_accounts}:
+                report("cuenta_numero_incompatible", "El número de cuenta indicado en el mayor contradice la cuenta seleccionada.")
+            elif len(matching_accounts) != 1:
+                report("cuenta_coincidencia_ambigua", "El número indicado en el mayor coincide con más de una cuenta del mismo banco y moneda.")
+        elif ending:
+            document_bank = ledger_bank or next((_bank_key(item.get("banco")) for item in bank_contexts if item.get("banco")), "")
+            if country_code != "SV" or not document_bank or not detected_currency:
+                report("cuenta_datos_insuficientes", "La terminación del mayor requiere banco y moneda verificables antes de vincularse.")
+            else:
+                matching_accounts = [
+                    candidate for candidate in available_accounts
+                    if _bank_key(candidate.get("banco")) == document_bank
+                    and str(candidate.get("moneda_codigo") or "").strip().upper() == detected_currency
+                    and (_account_digits(candidate.get("numero_terminacion")) or _account_digits(candidate.get("numero"))).endswith(ending[-4:])
+                ]
+                if len(matching_accounts) != 1 or matching_accounts[0]["id"] != account["id"]:
+                    report("cuenta_coincidencia_ambigua", "La terminación del mayor no identifica de forma única la cuenta seleccionada.")
+
+    has_multiple_accounts = any(
+        left[0] != right[0]
+        or left[1] != right[1]
+        or (
+            left[2] != right[2]
+            and not (
+                len(left[2]) == 4 and right[2].endswith(left[2])
+                or len(right[2]) == 4 and left[2].endswith(right[2])
+            )
+        )
+        for index, left in enumerate(bank_identities)
+        for right in bank_identities[index + 1:]
+    )
+    if has_multiple_accounts:
+        report("documentos_cuentas_multiples", "Los estados bancarios recibidos identifican más de una cuenta; no se mezclarán en este análisis.")
+    return diagnostics, suggestion
+
+
 def _movement_reference(movement):
     for key in ("referencia", "numero_transaccion", "numero_cheque"):
         value = movement.get(key)
         if value not in (None, ""):
             return str(value).strip()
     return None
+
+
+def _movement_references(movement):
+    references = set()
+    primary = _movement_reference(movement)
+    if primary:
+        references.add(primary)
+    original = movement.get("datos_originales")
+    if isinstance(original, dict):
+        for key, value in original.items():
+            normalized = _normalized_text(key)
+            if value not in (None, "") and (
+                "referencia" in normalized
+                or "numero de origen" in normalized
+                or "numero de pago" in normalized
+            ):
+                references.add(str(value).strip())
+    return references
+
+
+def _normalized_text(value):
+    text = unicodedata.normalize("NFKD", str(value or "").casefold())
+    return "".join(character for character in text if not unicodedata.combining(character))
+
+
+def _has_explicit_cancellation(movement):
+    descriptions = [movement.get("descripcion"), movement.get("codigo_tt")]
+    original = movement.get("datos_originales")
+    if isinstance(original, dict):
+        descriptions.extend(
+            value for key, value in original.items()
+            if any(word in _normalized_text(key) for word in ("descripcion", "transaccion", "tipo"))
+        )
+    return any(
+        re.search(r"\b(cancel\w*|anul\w*|revers\w*|extorn\w*|void|reversal)\b", _normalized_text(value))
+        for value in descriptions
+        if value not in (None, "")
+    )
+
+
+def _pending_reversal_groups(items):
+    candidates = []
+    for left_index, left in enumerate(items):
+        left_movement = left.get("movimiento", {})
+        left_amount = _parse_decimal(left_movement.get("monto"))
+        left_references = _movement_references(left_movement)
+        if left_amount is None or not left_references:
+            continue
+        for right_index in range(left_index + 1, len(items)):
+            right = items[right_index]
+            right_movement = right.get("movimiento", {})
+            right_amount = _parse_decimal(right_movement.get("monto"))
+            if right_amount != -left_amount:
+                continue
+            shared_references = left_references & _movement_references(right_movement)
+            cancellation_pair = (
+                _has_explicit_cancellation(left_movement)
+                != _has_explicit_cancellation(right_movement)
+            )
+            if shared_references and cancellation_pair:
+                candidates.append((left_index, right_index, sorted(shared_references)[0]))
+
+    partners = {}
+    for left_index, right_index, reference in candidates:
+        partners.setdefault(left_index, []).append((right_index, reference))
+        partners.setdefault(right_index, []).append((left_index, reference))
+
+    groups = []
+    grouped_indexes = set()
+    for left_index, right_index, reference in candidates:
+        if (
+            left_index in grouped_indexes
+            or right_index in grouped_indexes
+            or len(partners.get(left_index, [])) != 1
+            or len(partners.get(right_index, [])) != 1
+        ):
+            continue
+        left, right = items[left_index], items[right_index]
+        left_movement, right_movement = left["movimiento"], right["movimiento"]
+        pair = [left, right]
+        pair.sort(key=lambda item: (
+            str(item.get("fecha") or ""),
+            int(item.get("evidencia", {}).get("fila") or item.get("movimiento", {}).get("fila_origen") or 0),
+        ))
+        group_id = f"reversion:{reference}:{left.get('id')}:{right.get('id')}"
+        groups.append({
+            "id": group_id,
+            "referencia": reference,
+            "neto": "0.00",
+            "fecha": min(str(left_movement.get("fecha") or ""), str(right_movement.get("fecha") or "")),
+            "movimientos": pair,
+            "motivo": "Cancelación identificada por referencia de pago, importe opuesto y descripción explícita.",
+        })
+        left["grupo_reversion_id"] = group_id
+        right["grupo_reversion_id"] = group_id
+        grouped_indexes.update((left_index, right_index))
+
+    ambiguous_adjacency = {}
+    ambiguous_references = {}
+    for left_index, right_index, reference in candidates:
+        if left_index in grouped_indexes and right_index in grouped_indexes:
+            continue
+        ambiguous_adjacency.setdefault(left_index, set()).add(right_index)
+        ambiguous_adjacency.setdefault(right_index, set()).add(left_index)
+        ambiguous_references.setdefault(left_index, set()).add(reference)
+        ambiguous_references.setdefault(right_index, set()).add(reference)
+    ambiguous = []
+    visited = set()
+    for start_index in sorted(ambiguous_adjacency):
+        if start_index in visited:
+            continue
+        component = set()
+        stack = [start_index]
+        while stack:
+            index = stack.pop()
+            if index in visited:
+                continue
+            visited.add(index)
+            component.add(index)
+            stack.extend(ambiguous_adjacency.get(index, set()) - visited)
+        references = sorted({
+            reference
+            for index in component
+            for reference in ambiguous_references.get(index, set())
+        })
+        ambiguous.append({
+            "id": f"reversion_pendiente:{':'.join(references)}:{':'.join(str(items[index].get('id')) for index in sorted(component))}",
+            "referencia": ", ".join(references),
+            "movimientos": [items[index] for index in sorted(component)],
+            "motivo": "Hay varias contrapartes posibles para esta referencia; requiere revisión.",
+        })
+    return groups, ambiguous, grouped_indexes
+
+
+def _pending_date_groups(items, grouped_indexes):
+    dates = {}
+    for index, item in enumerate(items):
+        movement = item.get("movimiento", {})
+        day = str(movement.get("fecha") or "Sin fecha")
+        group = dates.setdefault(day, {
+            "fecha": day,
+            "neto": Decimal("0.00"),
+            "cantidad": 0,
+            "cantidad_reversiones": 0,
+            "movimientos": [],
+        })
+        amount = _parse_decimal(item.get("importe_con_signo"))
+        if amount is not None:
+            group["neto"] += amount
+        if index not in grouped_indexes:
+            group["cantidad"] += 1
+            group["movimientos"].append(item)
+        else:
+            group["cantidad_reversiones"] += 1
+    return [
+        {
+            **group,
+            "neto": str(group["neto"].quantize(Decimal("0.01"))),
+        }
+        for _, group in sorted(dates.items())
+    ]
 
 
 def _dashboard_sections(result):
@@ -218,6 +708,8 @@ def _dashboard_sections(result):
                 "resultado": "Ambiguo; requiere revisión",
                 "banco_indices": [int(item.split(":", 1)[1]) for item in bank_ids],
                 "contabilidad_indices": [int(item.split(":", 1)[1]) for item in book_ids],
+                "banco_ids": list(bank_ids),
+                "contabilidad_ids": list(book_ids),
                 "banco": [bank_movements[int(item.split(":", 1)[1])] for item in bank_ids],
                 "contabilidad": [book_movements[int(item.split(":", 1)[1])] for item in book_ids],
                 "explicacion": proposal.explanation,
@@ -232,15 +724,19 @@ def _dashboard_sections(result):
                 "resultado": "Diferencia de importe; no confirmado",
                 "banco_indices": [int(item.split(":", 1)[1]) for item in bank_ids],
                 "contabilidad_indices": [int(item.split(":", 1)[1]) for item in book_ids],
+                "banco_ids": list(bank_ids),
+                "contabilidad_ids": list(book_ids),
+                "banco": [bank_movements[int(item.split(":", 1)[1])] for item in bank_ids],
+                "contabilidad": [book_movements[int(item.split(":", 1)[1])] for item in book_ids],
                 "explicacion": proposal.explanation,
             })
 
     unmatched_bank = [
-        {"indice": index, "movimiento": movement, "situacion": "Sin contraparte inequívoca en Contabilidad", "evidencia": evidence_of(movement)}
+        {"indice": index, "movimiento_id": f"bank:{index}", "movimiento": movement, "situacion": "Sin contraparte inequívoca en Contabilidad", "evidencia": evidence_of(movement)}
         for index, movement in enumerate(bank_movements) if index not in claimed_bank
     ]
     unmatched_books = [
-        {"indice": index, "movimiento": movement, "situacion": "Sin contraparte inequívoca en Banco", "evidencia": evidence_of(movement)}
+        {"indice": index, "movimiento_id": f"books:{index}", "movimiento": movement, "situacion": "Sin contraparte inequívoca en Banco", "evidencia": evidence_of(movement)}
         for index, movement in enumerate(book_movements) if index not in claimed_books
     ]
 
@@ -305,8 +801,12 @@ def _historical_cheques(path):
         for sheet in workbook.worksheets:
             for row_number, row in enumerate(sheet.iter_rows(values_only=True), start=1):
                 values = [str(value).strip() if value is not None else "" for value in row[:4]]
-                if any("MES DE " in value.upper() for value in values):
-                    text = " ".join(values).upper()
+                text = " ".join(values).upper()
+                cutoff_match = re.search(r"\bAL\s+(\d{1,2})/(\d{1,2})/(\d{4})\b", text)
+                if cutoff_match:
+                    cutoff = date(*(int(value) for value in (cutoff_match[3], cutoff_match[2], cutoff_match[1])))
+                    declared_period = cutoff.strftime("%Y-%m")
+                elif any("MES DE " in value for value in values):
                     for year in range(2020, 2031):
                         for month_name, month in (
                             ("ENERO", 1), ("FEBRERO", 2), ("MARZO", 3), ("ABRIL", 4),
@@ -317,37 +817,47 @@ def _historical_cheques(path):
                                 declared_period = f"{year}-{month:02d}"
                                 break
             headers_row = None
+            column_indexes = None
             for row_number, row in enumerate(sheet.iter_rows(values_only=True), start=1):
-                normalized = [str(value).strip().upper() if value is not None else "" for value in row[:4]]
-                if "FECHA" in normalized and "NO. DOC." in normalized and "MONTO" in normalized:
+                normalized = [str(value).strip().upper() if value is not None else "" for value in row]
+                date_index = next((i for i, value in enumerate(normalized) if value == "FECHA"), None)
+                document_index = next((
+                    i for i, value in enumerate(normalized)
+                    if value in {"NO. DOC.", "NO. DOC", "NO. REFERENCIA"}
+                ), None)
+                amount_index = next((i for i, value in enumerate(normalized) if value == "MONTO"), None)
+                if date_index is not None and document_index is not None and amount_index is not None:
                     headers_row = row_number
+                    column_indexes = (date_index, document_index, amount_index)
                     break
             if headers_row is None:
                 continue
+            date_index, document_index, amount_index = column_indexes
             for row_number, row in enumerate(
                 sheet.iter_rows(min_row=headers_row + 1, max_row=sheet.max_row, values_only=True),
                 start=headers_row + 1,
             ):
-                if row_number == headers_row:
+                if all(value is None for value in row):
                     continue
-                if len(row) < 4 or all(value is None for value in row[:4]):
+                if any(
+                    str(value).strip().upper().startswith(("TOTAL", "TTAL"))
+                    for value in row if value is not None
+                ):
                     continue
                 description = row[1] if len(row) > 1 else None
-                if isinstance(description, str) and description.strip().upper().startswith("TTAL"):
-                    continue
-                document = str(row[2]).strip() if row[2] is not None else ""
-                amount = _parse_decimal(row[3])
+                document = str(row[document_index]).strip() if row[document_index] is not None else ""
+                amount = _parse_decimal(row[amount_index])
                 if amount is None:
-                    continue
+                    raise ValueError(f"Fila {row_number}: el monto del cheque no es numérico.")
                 records.append({
-                    "fecha": str(row[0]).strip() if row[0] is not None else None,
+                    "fecha": str(row[date_index]).strip() if row[date_index] is not None else None,
                     "descripcion": description,
                     "numero_documento": document,
                     "numero_cero": document in ("", "0"),
                     "monto": str(amount),
                     "hoja": sheet.title,
                     "fila": row_number,
-                    "valor_original": list(row[:4]),
+                    "valor_original": list(row[:max(date_index, document_index, amount_index) + 1]),
                     "archivo": path.name,
                 })
         return {"periodo_corte": declared_period, "registros": records}
@@ -355,7 +865,7 @@ def _historical_cheques(path):
         workbook.close()
 
 
-def _analyze_files(job_dir, country_code):
+def _analyze_files(job_dir, country_code, period=None):
     result = {
         "archivos": [],
         "banco": None,
@@ -367,16 +877,44 @@ def _analyze_files(job_dir, country_code):
     }
     period_hint = None
     cutoff_hint = None
+    requested_period = None
+    if period not in (None, ""):
+        requested_period, _, _, _ = _period_dates(period)
     for source in sorted(job_dir.glob("originales/*")):
         path = Path(source)
         normalized_path = None
-        if path.suffix.lower() == ".xls":
-            normalized_dir = job_dir / "normalizados"
-            normalized_dir.mkdir(parents=True, exist_ok=True)
-            normalized_path = normalized_dir / f"{path.stem}.xlsx"
-            _normalize_xls(path, normalized_path)
-            path = normalized_path
-        recognition = recognize_workbook(path)
+        synthetic_header = False
+        is_cheque_file = "cheque" in source.name.casefold()
+        try:
+            if path.suffix.lower() == ".xls":
+                normalized_dir = job_dir / "normalizados"
+                normalized_dir.mkdir(parents=True, exist_ok=True)
+                normalized_path = normalized_dir / f"{path.stem}.xlsx"
+                synthetic_header = _normalize_xls(path, normalized_path)
+                path = normalized_path
+            recognition = recognize_workbook(path)
+        except (BadZipFile, InvalidFileException, OSError, ParseError, ValueError, KeyError, IndexError, ValidationError) as exc:
+            if not is_cheque_file:
+                raise
+            reason = (
+                "; ".join(str(value) for value in exc.detail.values())
+                if isinstance(exc, ValidationError) and isinstance(exc.detail, dict)
+                else str(exc).strip()
+            ) or exc.__class__.__name__
+            result["diagnosticos"].append({
+                "archivo": source.name,
+                "codigo": "error_importacion_cheques",
+                "mensaje": f"No se pudo leer el archivo de cheques: {reason}",
+            })
+            result["archivos"].append({
+                "nombre": source.name,
+                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                "tamano_bytes": source.stat().st_size,
+                "reconocimiento": {"reconocido": False, "motivo": reason},
+            })
+            continue
+        if synthetic_header:
+            recognition["encabezado_sintetico"] = True
         original_name = str(source.name).upper()
         recognition_context = recognition.setdefault("contexto", {})
         if "PROMERICA" in original_name:
@@ -391,6 +929,16 @@ def _analyze_files(job_dir, country_code):
             recognition_context["moneda_codigo"] = "USD"
             if not recognition_context.get("terminacion"):
                 recognition_context["terminacion"] = "0386"
+        elif recognition.get("perfil_sugerido") == "banco_cuscatlan_movimientos":
+            account_digits = re.sub(r"\D", "", re.sub(r"\(\d+\)", "", source.stem))
+            recognition_context.update({
+                "banco": "Banco Cuscatlán",
+                "pais_codigo": "SV",
+                "moneda_codigo": recognition_context.get("moneda_codigo") or "USD",
+            })
+            if account_digits:
+                recognition_context["cuenta_bancaria"] = account_digits
+                recognition_context["terminacion"] = account_digits[-4:]
         recognition_origin = recognition.get("origen_sugerido") if recognition.get("reconocido") else None
         evidence = {
             "nombre": source.name,
@@ -399,9 +947,21 @@ def _analyze_files(job_dir, country_code):
             "reconocimiento": recognition,
         }
         if recognition_origin == "banco":
-            period_hint = recognition.get("contexto", {}).get("periodo_declarado") or period_hint
+            recognition_period = recognition.get("contexto", {}).get("periodo_declarado")
+            period_hint = (
+                requested_period.strftime("%Y-%m")
+                if requested_period else recognition_period or period_hint
+            )
             cutoff_hint, _ = _cutoff_from_recognition(recognition)
-            period = cutoff_hint.replace(day=1) if cutoff_hint else None
+            validation_period = cutoff_hint.replace(day=1) if cutoff_hint else None
+            validation_cutoff = cutoff_hint
+            if (
+                requested_period
+                and recognition.get("perfil_sugerido") == "banco_cuscatlan_movimientos"
+            ):
+                selected_start, selected_end, previous_start, _ = _period_dates(requested_period)
+                validation_period = previous_start
+                validation_cutoff = selected_end
             validated = validate_workbook(
                 path,
                 sheet_name=recognition["hoja"],
@@ -409,8 +969,8 @@ def _analyze_files(job_dir, country_code):
                 mapping=recognition["mapping"],
                 date_format=recognition.get("date_format"),
                 origin="banco",
-                period=period,
-                cutoff=cutoff_hint,
+                period=validation_period,
+                cutoff=validation_cutoff,
                 confirm_date_proposals=False,
             )
             if validated.propuestas_normalizacion_fecha:
@@ -428,8 +988,8 @@ def _analyze_files(job_dir, country_code):
                         mapping=recognition["mapping"],
                         date_format=recognition.get("date_format"),
                         origin="banco",
-                        period=period,
-                        cutoff=cutoff_hint,
+                        period=validation_period,
+                        cutoff=validation_cutoff,
                         confirm_date_proposals=True,
                     )
                 else:
@@ -438,6 +998,87 @@ def _analyze_files(job_dir, country_code):
                         "mensaje": "Hay propuestas de fecha pendientes de confirmación; se conservarán las filas como excluidas hasta resolverlas.",
                         "detalle": validated.propuestas_normalizacion_fecha,
                     })
+            bank_movements = validated.movimientos
+            is_cuscatlan = recognition.get("perfil_sugerido") == "banco_cuscatlan_movimientos"
+            bank_exclusions = validated.exclusiones_requeridas
+            if is_cuscatlan:
+                for movement in validated.movimientos:
+                    origin_data = movement.setdefault("datos_originales", {})
+                    origin_data["archivo"] = source.name
+                    origin_data["hoja"] = recognition["hoja"]
+                    if recognition.get("encabezado_sintetico"):
+                        movement["fila_origen"] = max(1, movement["fila_origen"] - 1)
+                target_period = requested_period or (
+                    date.fromisoformat(f"{recognition_period}-01") if recognition_period else None
+                )
+                if target_period is None:
+                    result["diagnosticos"].append({
+                        "archivo": source.name,
+                        "codigo": "periodo_cuscatlan_faltante",
+                        "mensaje": "Selecciona el mes y año que deseas conciliar.",
+                    })
+                else:
+                    bank_exclusions = []
+                    opening, opening_error = _resolve_cuscatlan_opening_balance(
+                        validated.movimientos, recognition, target_period
+                    )
+                    if opening and not opening.get("archivo"):
+                        opening["archivo"] = source.name
+                    selected_start, selected_end, _, _ = _period_dates(target_period)
+                    current_movements = [
+                        movement for movement in validated.movimientos
+                        if selected_start.isoformat() <= movement["fecha"] <= selected_end.isoformat()
+                    ]
+                    current_movements.sort(
+                        key=lambda movement: (
+                            movement.get("fecha") or "",
+                            int(movement.get("fila_origen") or 0),
+                        )
+                    )
+                    bank_movements = current_movements
+                    context = recognition["contexto"]
+                    context["periodo_declarado"] = selected_start.strftime("%Y-%m")
+                    context["periodo_seleccionado"] = selected_start.strftime("%Y-%m")
+                    current_dates = [movement["fecha"] for movement in current_movements]
+                    context["cobertura_periodo_observada"] = (
+                        {"desde": min(current_dates), "hasta": max(current_dates)}
+                        if current_dates else None
+                    )
+                    declared_coverage = context.get("cobertura_declarada") or {}
+                    context["cobertura_periodo_estado"] = (
+                        "completa"
+                        if context.get("tipo_cobertura") == "declarada"
+                        and declared_coverage
+                        and declared_coverage.get("desde", "") <= selected_start.isoformat()
+                        and declared_coverage.get("hasta", "") >= selected_end.isoformat()
+                        else "incierta"
+                    )
+                    context["saldo_inicial"] = opening.get("saldo") if opening else None
+                    context["saldo_inicial_evidencia"] = opening
+                    if opening_error:
+                        result["diagnosticos"].append({
+                            "archivo": source.name,
+                            "codigo": "saldo_inicial_bancario_faltante",
+                            "mensaje": opening_error,
+                        })
+                    if not context["cobertura_periodo_estado"] == "completa":
+                        result["diagnosticos"].append({
+                            "archivo": source.name,
+                            "codigo": "cobertura_bancaria_incierta",
+                            "mensaje": (
+                                "La cobertura del estado no confirma el cierre del mes seleccionado; "
+                                "el saldo final mostrado es el último Saldo Real observado."
+                            ),
+                        })
+                    if current_movements:
+                        context["saldo_final_observado"] = current_movements[-1].get("saldo_origen")
+                        context["saldo_final_observado_evidencia"] = {
+                            "archivo": source.name,
+                            "hoja": recognition["hoja"],
+                            "fila": current_movements[-1].get("fila_origen"),
+                            "fecha": current_movements[-1].get("fecha"),
+                        }
+                        cutoff_hint = date.fromisoformat(current_movements[-1]["fecha"])
             for movement in validated.movimientos:
                 origin_data = movement.setdefault("datos_originales", {})
                 origin_data["archivo"] = source.name
@@ -445,19 +1086,25 @@ def _analyze_files(job_dir, country_code):
             result["banco"] = {
                 "nombre": path.name,
                 "reconocimiento": recognition,
-                "movimientos": validated.movimientos,
+                "movimientos": bank_movements,
+                "saldo_inicial": recognition.get("contexto", {}).get("saldo_inicial"),
+                "saldo_inicial_evidencia": recognition.get("contexto", {}).get("saldo_inicial_evidencia"),
                 "filas_analizadas": validated.filas_analizadas,
                 "errores": validated.errores,
                 "advertencias": validated.advertencias,
-                "exclusiones_requeridas": validated.exclusiones_requeridas,
+                "exclusiones_requeridas": bank_exclusions,
                 "propuestas_normalizacion_fecha": validated.propuestas_normalizacion_fecha,
                 "normalizaciones_fecha_aplicadas": validated.normalizaciones_fecha_aplicadas,
             }
-            result["movimientos_banco"] = validated.movimientos
+            result["movimientos_banco"] = bank_movements
         elif recognition_origin == "libros":
             period_hint = recognition.get("contexto", {}).get("periodo_declarado") or period_hint
             cutoff_hint, _ = _cutoff_from_recognition(recognition)
-            period = cutoff_hint.replace(day=1) if cutoff_hint else None
+            period = requested_period or (cutoff_hint.replace(day=1) if cutoff_hint else None)
+            ledger_cutoff = (
+                date(period.year, period.month, monthrange(period.year, period.month)[1])
+                if period else cutoff_hint
+            )
             validated = validate_workbook(
                 path,
                 sheet_name=recognition["hoja"],
@@ -466,12 +1113,17 @@ def _analyze_files(job_dir, country_code):
                 date_format=recognition.get("date_format"),
                 origin="libros",
                 period=period,
-                cutoff=cutoff_hint,
+                cutoff=ledger_cutoff,
             )
             for movement in validated.movimientos:
                 origin_data = movement.setdefault("datos_originales", {})
                 origin_data["archivo"] = source.name
                 origin_data["hoja"] = recognition["hoja"]
+            ledger_context = recognition.get("contexto") or {}
+            opening_evidence = ledger_context.get("saldo_inicial_evidencia")
+            if isinstance(opening_evidence, dict):
+                opening_evidence["archivo"] = source.name
+                opening_evidence["hoja"] = opening_evidence.get("hoja") or recognition["hoja"]
             result["libros"] = {
                 "nombre": path.name,
                 "reconocimiento": recognition,
@@ -485,12 +1137,28 @@ def _analyze_files(job_dir, country_code):
             }
             result["movimientos_libros"] = validated.movimientos
         else:
-            historical = _historical_cheques(path)
+            try:
+                historical = _historical_cheques(path)
+            except (BadZipFile, InvalidFileException, OSError, ParseError, ValueError, KeyError, IndexError, ValidationError) as exc:
+                reason = (
+                    "; ".join(str(value) for value in exc.detail.values())
+                    if isinstance(exc, ValidationError) and isinstance(exc.detail, dict)
+                    else str(exc).strip()
+                ) or exc.__class__.__name__
+                result["diagnosticos"].append({
+                    "archivo": source.name,
+                    "codigo": "error_importacion_cheques",
+                    "mensaje": f"No se pudo importar el archivo de cheques: {reason}",
+                })
+                historical = None
+            if historical is None:
+                result["archivos"].append(evidence)
+                continue
             if historical["registros"]:
                 result["cheques"].append({"nombre": path.name, **historical})
             else:
                 result["diagnosticos"].append({
-                    "archivo": path.name,
+                    "archivo": source.name,
                     "codigo": "formato_no_reconocido",
                     "mensaje": recognition.get("motivo") or "No se identificaron encabezados compatibles.",
                 })
@@ -564,8 +1232,9 @@ def _analyze_files(job_dir, country_code):
                 for index, movement in enumerate(result["movimientos_banco"]):
                     if index in claimed_cheque_banco:
                         continue
-                    description = str(movement.get("descripcion") or "")
-                    refs = alternatives_refs = {
+                    if str(movement.get("codigo_tt") or "").strip().upper() != "CQ":
+                        continue
+                    refs = {
                         str(value).strip()
                         for value in (
                             movement.get("referencia"),
@@ -580,7 +1249,7 @@ def _analyze_files(job_dir, country_code):
                             if str(key).casefold().startswith("referencia") and value not in (None, ""):
                                 refs.add(str(value).strip())
                     bank_amount = _parse_decimal(movement.get("monto"))
-                    if number in refs and bank_amount is not None and abs(bank_amount) == abs(cheque_amount):
+                    if number in refs and bank_amount is not None and bank_amount == cheque_amount:
                         candidates.append((index, movement))
             record["estado_al_corte"] = "pendiente_identificacion" if number in ("", "0") else "pendiente_cobro_o_identificacion"
             record["cobro_identificado"] = []
@@ -596,7 +1265,9 @@ def _analyze_files(job_dir, country_code):
                 record["estado_al_corte"] = "cobrado_identificado_en_banco"
                 record["cobro_identificado"] = [{
                     "fecha": movement.get("fecha"),
-                    "referencia": sorted({
+                    "tipo_movimiento": movement.get("codigo_tt"),
+                    "referencia": number,
+                    "referencias_banco": sorted({
                         str(value).strip() for value in (
                             movement.get("referencia"),
                             movement.get("numero_transaccion"),
@@ -604,6 +1275,7 @@ def _analyze_files(job_dir, country_code):
                         ) if value not in (None, "")
                     }),
                     "monto": movement.get("monto"),
+                    "movimiento_id": f"bank:{index}",
                     "evidencia": evidence,
                 }]
 
@@ -621,6 +1293,10 @@ def _analyze_files(job_dir, country_code):
     movements_bank = len(bank["movimientos"]) if bank else 0
     bank_rows = bank["filas_analizadas"] if bank else 0
     movements_ledger = len(ledger["movimientos"]) if ledger else 0
+    pending_bank_ids = {
+        item.get("movimiento_id")
+        for item in result.get("proceso_conciliacion", {}).get("movimientos_sin_contraparte", {}).get("banco", [])
+    }
     partidas = []
     for cut in result.get("cheques", []):
         for record in cut.get("registros", []):
@@ -628,13 +1304,28 @@ def _analyze_files(job_dir, country_code):
             if len(cobros) == 1:
                 cobro = cobros[0]
                 bank_amount = _parse_decimal(cobro.get("monto"))
+                affects_residual = (
+                    cobro.get("movimiento_id") in pending_bank_ids
+                    and bank_amount is not None
+                    and bank_amount < 0
+                )
                 partidas.append({
+                    "id": cobro.get("movimiento_id"),
+                    "movimiento_id": cobro.get("movimiento_id"),
                     "tipo": "cheque_historico_cobrado",
                     "concepto": f"Cobro identificado del cheque histórico {record.get('numero_documento')}",
                     "importe": cobro.get("monto"),
+                    "importe_con_signo": str(bank_amount) if bank_amount is not None else None,
                     "lado": "Banco",
                     "signo": "salida" if bank_amount is not None and bank_amount < 0 else "pendiente",
-                    "diferencia_signo": cobro.get("monto"),
+                    "diferencia_signo": str(bank_amount) if affects_residual else "0.00",
+                    "afecta_residual": affects_residual,
+                    "movimiento_id": cobro.get("movimiento_id"),
+                    "motivo": (
+                        "Cargo bancario CQ identificado por referencia e importe exactos; sigue sin contraparte contable y se aplica una sola vez al residual."
+                        if affects_residual else
+                        "Cargo bancario CQ identificado, pero ya está consumido por otro cruce o no es un cargo pendiente; no se vuelve a aplicar al residual."
+                    ),
                     "evidencia_banco": cobro.get("evidencia"),
                     "evidencia_historico": {
                         "archivo": record.get("archivo"),
@@ -652,6 +1343,16 @@ def _analyze_files(job_dir, country_code):
     proceso = result.get("proceso_conciliacion", {})
     result["resumen"] = {
         "saldo_final_banco": str(final_bank) if final_bank is not None else None,
+        "saldo_inicial_banco": (
+            bank.get("saldo_inicial") if bank and bank.get("saldo_inicial") is not None else None
+        ),
+        "saldo_inicial_banco_evidencia": (
+            bank.get("saldo_inicial_evidencia") if bank else None
+        ),
+        "cobertura_periodo_bancario": (
+            bank.get("reconocimiento", {}).get("contexto", {}).get("cobertura_periodo_estado")
+            if bank else None
+        ),
         "saldo_final_contabilidad": str(final_ledger) if final_ledger is not None else None,
         "diferencia_original": str(original_difference) if original_difference is not None else None,
         "partidas_conciliatorias": partidas,
@@ -669,6 +1370,7 @@ def _analyze_files(job_dir, country_code):
             "pendientes_contabilidad": max(0, len(ledger["propuestas_normalizacion_fecha"]) - len(ledger["normalizaciones_fecha_aplicadas"])) if ledger else 0,
         },
     }
+    _difference_explanation(result)
     bank_context = (result["banco"]["reconocimiento"]["contexto"] if result["banco"] else {})
     ledger_context = (result["libros"]["reconocimiento"]["contexto"] if result["libros"] else {})
     detected_account = bank_context.get("cuenta_bancaria") or ledger_context.get("cuenta_bancaria") or ("0040040592" if country_code == "GT" else None)
@@ -690,6 +1392,401 @@ def _analyze_files(job_dir, country_code):
         "codigo_contable": ledger_context.get("codigo_contable"),
     }
     return result
+
+
+def _difference_explanation(result):
+    summary = result.get("resumen", {})
+    proceso = result.get("proceso_conciliacion", {})
+    original = _parse_decimal(summary.get("diferencia_original"))
+    explanatory = []
+    applied = []
+    applied_effect = Decimal("0.00")
+    for partida in summary.get("partidas_conciliatorias", []):
+        amount = _parse_decimal(partida.get("importe_con_signo", partida.get("importe")))
+        affects = bool(partida.get("afecta_residual"))
+        effect = _parse_decimal(partida.get("diferencia_signo")) if affects else Decimal("0.00")
+        if effect is None:
+            effect = Decimal("0.00")
+        item = {
+            "id": partida.get("movimiento_id", partida.get("id")),
+            "concepto": partida.get("concepto") or partida.get("tipo") or "Partida",
+            "importe_con_signo": str(amount) if amount is not None else None,
+            "lado": partida.get("lado") or "No identificado",
+            "motivo": partida.get("motivo") or "No hay evidencia registrada.",
+            "evidencia": {
+                "banco": partida.get("evidencia_banco"),
+                "historico": partida.get("evidencia_historico"),
+            },
+            "verificada": bool(partida.get("verificado")),
+            "afecta_residual": affects,
+            "impacto_residual": str(effect),
+        }
+        explanatory.append(item)
+        if affects and item["verificada"]:
+            applied.append(item)
+            applied_effect += effect
+
+    residual = (original + applied_effect).quantize(Decimal("0.01")) if original is not None else None
+    summary["diferencia_residual_pendiente"] = str(residual) if residual is not None else None
+    unmatched = proceso.get("movimientos_sin_contraparte", {})
+    identified_historical_bank_ids = {
+        partida.get("movimiento_id")
+        for partida in summary.get("partidas_conciliatorias", [])
+        if partida.get("tipo") == "cheque_historico_cobrado" and partida.get("verificado")
+    }
+
+    def pending(side):
+        total = Decimal("0")
+        items = []
+        for item in unmatched.get(side, []):
+            if side == "banco" and item.get("movimiento_id") in identified_historical_bank_ids:
+                continue
+            movement = item.get("movimiento", {})
+            amount = _parse_decimal(movement.get("monto"))
+            if amount is not None:
+                total += amount
+            items.append({
+                "id": item.get("movimiento_id"),
+                "fecha": movement.get("fecha"),
+                "referencia": _movement_reference(movement),
+                "descripcion": movement.get("descripcion"),
+                "importe_con_signo": str(amount) if amount is not None else None,
+                "movimiento": movement,
+                "evidencia": item.get("evidencia"),
+                "estado_al_cierre": item.get("situacion") or "Sin contraparte inequívoca al cierre",
+            })
+        return {"neto": str(total.quantize(Decimal("0.01"))), "movimientos": items}
+
+    bank_pending = pending("banco")
+    books_pending = pending("contabilidad")
+    bank_pending["grupos_fecha"] = _pending_date_groups(bank_pending["movimientos"], set())
+    reversal_groups, reversal_review, grouped_book_indexes = _pending_reversal_groups(
+        books_pending["movimientos"]
+    )
+    books_pending["grupos_fecha"] = _pending_date_groups(
+        books_pending["movimientos"], grouped_book_indexes
+    )
+    books_pending["reversiones_identificadas"] = reversal_groups
+    books_pending["reversiones_por_revisar"] = reversal_review
+    candidates = []
+    candidates.extend({
+        "tipo": "reversion_ambigua",
+        "criterio": f"Referencia de pago {group['referencia']}",
+        "explicacion": group["motivo"],
+        "contabilidad": [
+            {
+                "id": item.get("id"),
+                "movimiento": item.get("movimiento", {}),
+                "evidencia": item.get("evidencia"),
+            }
+            for item in group["movimientos"]
+        ],
+        "banco": [],
+    } for group in reversal_review)
+    for category, groups in (
+        ("agrupacion_ambigua", proceso.get("alternativas_ambiguas", [])),
+        ("diferencia_de_importe", proceso.get("diferencias_importe", [])),
+    ):
+        for group in groups:
+            candidates.append({
+                "tipo": category,
+                "criterio": group.get("criterio"),
+                "explicacion": group.get("explicacion"),
+                "banco": [
+                    {
+                        "id": f"bank:{index}",
+                        "movimiento": movement,
+                        "evidencia": {
+                            "archivo": (movement.get("datos_originales") or {}).get("archivo"),
+                            "hoja": (movement.get("datos_originales") or {}).get("hoja"),
+                            "fila": movement.get("fila_origen"),
+                        },
+                    }
+                    for index, movement in zip(group.get("banco_indices", []), group.get("banco", []))
+                ],
+                "contabilidad": [
+                    {
+                        "id": f"books:{index}",
+                        "movimiento": movement,
+                        "evidencia": {
+                            "archivo": (movement.get("datos_originales") or {}).get("archivo"),
+                            "hoja": (movement.get("datos_originales") or {}).get("hoja"),
+                            "fila": movement.get("fila_origen"),
+                        },
+                    }
+                    for index, movement in zip(group.get("contabilidad_indices", []), group.get("contabilidad", []))
+                ],
+            })
+
+    bank_context = ((result.get("banco") or {}).get("reconocimiento") or {}).get("contexto") or {}
+    ledger_context = ((result.get("libros") or {}).get("reconocimiento") or {}).get("contexto") or {}
+    direction = "banco_mayor" if original is not None and original > 0 else (
+        "banco_menor" if original is not None and original < 0 else "iguales" if original == 0 else "indeterminada"
+    )
+    currency = str(bank_context.get("moneda_codigo") or ledger_context.get("moneda_codigo") or "").upper()
+    currency_prefix = "$" if currency == "USD" else "Q " if currency == "GTQ" else ""
+    if residual is None:
+        formatted_residual = "No disponible"
+    else:
+        residual_amount = Decimal(str(residual)).quantize(Decimal("0.01"))
+        signed_amount = f"{abs(residual_amount):,.2f}"
+        formatted_residual = f"-{currency_prefix}{signed_amount}" if residual_amount < 0 else f"{currency_prefix}{signed_amount}"
+    bank_opening = _parse_decimal(bank_context.get("saldo_inicial"))
+    books_opening = _parse_decimal(ledger_context.get("saldo_inicial"))
+    bank_opening_evidence = bank_context.get("saldo_inicial_evidencia")
+    books_opening_evidence = ledger_context.get("saldo_inicial_evidencia")
+
+    def has_opening_evidence(evidence):
+        return isinstance(evidence, dict) and any(
+            evidence.get(key) not in (None, "")
+            for key in ("archivo", "hoja", "fila", "fecha", "metodo")
+        )
+
+    opening_difference = (
+        (bank_opening - books_opening).quantize(Decimal("0.01"))
+        if bank_opening is not None
+        and books_opening is not None
+        and has_opening_evidence(bank_opening_evidence)
+        and has_opening_evidence(books_opening_evidence)
+        else None
+    )
+    movement_difference = (
+        Decimal(bank_pending["neto"]) - Decimal(books_pending["neto"])
+    ).quantize(Decimal("0.01"))
+    breakdown_total = (
+        (opening_difference + movement_difference).quantize(Decimal("0.01"))
+        if opening_difference is not None else None
+    )
+    summary["explicacion_diferencia"] = {
+        "version": 1,
+        "diferencia_original": {
+            "saldo_banco": summary.get("saldo_final_banco"),
+            "saldo_contabilidad": summary.get("saldo_final_contabilidad"),
+            "importe": summary.get("diferencia_original"),
+            "importe_absoluto": str(abs(original)) if original is not None else None,
+            "formula": "saldo_banco - saldo_contabilidad",
+            "direccion": direction,
+        },
+        "residual": {
+            "partidas_aplicadas": applied,
+            "impacto_total_aplicado": str(applied_effect.quantize(Decimal("0.01"))),
+            "importe": summary.get("diferencia_residual_pendiente"),
+            "mensaje_sin_partidas": (
+                f"No hay partidas explicativas aplicadas; la diferencia residual sigue siendo {formatted_residual}."
+                if not applied and summary.get("diferencia_residual_pendiente") is not None else None
+            ),
+        },
+        "partidas_explicativas": explanatory,
+        "pendientes": {
+            "banco": bank_pending,
+            "contabilidad": books_pending,
+            "diferencia_neta_movimientos": str(movement_difference),
+        },
+        "candidatos": candidates,
+        "cobertura_y_saldos_iniciales": {
+            "banco": {
+                "cobertura": bank_context.get("cobertura_declarada"),
+                "saldo_inicial": bank_context.get("saldo_inicial"),
+                "evidencia": bank_context.get("saldo_inicial_evidencia"),
+            },
+            "contabilidad": {
+                "cobertura": ledger_context.get("cobertura_declarada"),
+                "saldo_inicial": ledger_context.get("saldo_inicial"),
+                "evidencia": ledger_context.get("saldo_inicial_evidencia"),
+            },
+        },
+        "diferencia_inicial": {
+            "saldo_banco": str(bank_opening) if bank_opening is not None else None,
+            "saldo_contabilidad": str(books_opening) if books_opening is not None else None,
+            "importe": str(opening_difference) if opening_difference is not None else None,
+            "evidencia_banco": bank_opening_evidence,
+            "evidencia_contabilidad": books_opening_evidence,
+            "origen_pendiente": (
+                "Origen pendiente de revisar en el cierre anterior"
+                if opening_difference is not None else None
+            ),
+        },
+        "desglose_diferencia": {
+            "diferencia_inicial": str(opening_difference) if opening_difference is not None else None,
+            "diferencia_neta_movimientos": str(movement_difference),
+            "total": str(breakdown_total) if breakdown_total is not None else None,
+            "coincide_con_diferencia_original": (
+                breakdown_total == original.quantize(Decimal("0.01"))
+                if breakdown_total is not None and original is not None else False
+            ),
+        },
+        "causa_determinada": bool(applied) and residual == 0,
+    }
+
+
+def _job_period(job):
+    value = job.get("periodo_sugerido")
+    if not value:
+        value = (job.get("resultado") or {}).get("contexto_resultado", {}).get("periodo")
+    match = re.match(r"^(\d{4}-\d{2})", str(value or ""))
+    return match.group(1) if match else None
+
+
+def _historical_difference_evidence(result, scope, account, current_job_id=None):
+    summary = result.get("resumen") or {}
+    explanation = summary.get("explicacion_diferencia") or {}
+    context = result.get("contexto_resultado") or {}
+    current_period = _job_period({"periodo_sugerido": context.get("periodo")})
+    if not current_period:
+        return
+    try:
+        current_start, _, _, _ = _period_dates(current_period)
+    except ValidationError:
+        return
+    previous_period = (current_start - timedelta(days=1)).strftime("%Y-%m")
+    selected_account_id = str(account.get("id") or "")
+    selected_currency = str(account.get("moneda_codigo") or "").upper()
+    history_root = _scope_jobs_path(scope)
+    related_jobs = []
+    if history_root.exists():
+        for metadata_path in history_root.glob("*/*/metadata.json"):
+            try:
+                saved_job = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            if (
+                saved_job.get("id") == current_job_id
+                or saved_job.get("empresa_id") != scope.get("company_id")
+                or saved_job.get("pais_codigo") != scope.get("country_code")
+                or str(saved_job.get("cuenta_id") or "") != selected_account_id
+                or str(saved_job.get("moneda_codigo") or "").upper() != selected_currency
+                or saved_job.get("sustituido_por")
+            ):
+                continue
+            saved_result = saved_job.get("resultado") or {}
+            saved_bank_context = (
+                ((saved_result.get("banco") or {}).get("reconocimiento") or {}).get("contexto") or {}
+            )
+            if str(saved_bank_context.get("moneda_codigo") or "").upper() != selected_currency:
+                continue
+            related_jobs.append((saved_job, saved_result, _job_period(saved_job)))
+
+    previous_jobs = [
+        saved_job for saved_job, _, period in related_jobs
+        if period == previous_period
+        and saved_job.get("estado") in ("finalizado_con_pendientes", "finalizado", "aprobado")
+    ]
+    previous_jobs.sort(
+        key=lambda job: (str(job.get("finalizado_en") or job.get("actualizado_en") or ""), str(job.get("id") or "")),
+        reverse=True,
+    )
+    previous = previous_jobs[0] if previous_jobs else None
+    explanation["conciliacion_anterior"] = ({
+        "id": previous.get("id"),
+        "periodo": previous_period,
+        "titulo": previous.get("titulo") or f"Conciliación de {previous_period}",
+    } if previous else None)
+    opening_difference = explanation.get("diferencia_inicial") or {}
+    if opening_difference.get("importe") is not None:
+        opening_difference["origen_pendiente"] = (
+            None if previous else "Origen pendiente de revisar en el cierre anterior"
+        )
+
+    later_bank_movements = []
+    seen_sources = set()
+    for saved_job, saved_result, period in related_jobs:
+        if not period or period <= current_period:
+            continue
+        bank = saved_result.get("banco") or {}
+        for movement in bank.get("movimientos", []):
+            movement_date = str(movement.get("fecha") or "")
+            if movement_date[:7] <= current_period:
+                continue
+            references = _movement_references(movement)
+            amount = _parse_decimal(movement.get("monto"))
+            if not references or amount is None:
+                continue
+            original = movement.get("datos_originales") or {}
+            source = (
+                movement_date,
+                tuple(sorted(references)),
+                str(amount),
+                original.get("archivo"),
+                original.get("hoja"),
+                movement.get("fila_origen"),
+            )
+            if source in seen_sources:
+                continue
+            seen_sources.add(source)
+            later_bank_movements.append({
+                "fecha": movement_date,
+                "referencias": references,
+                "monto": amount,
+                "periodo": period,
+                "evidencia": {
+                    "archivo": original.get("archivo"),
+                    "hoja": original.get("hoja"),
+                    "fila": movement.get("fila_origen"),
+                },
+                "movimiento": movement,
+            })
+
+    pending_books = explanation.get("pendientes", {}).get("contabilidad", {}).get("movimientos", [])
+    for item in pending_books:
+        movement = item.get("movimiento") or {}
+        item["reflejado_en_periodo_posterior"] = None
+        references = _movement_references(movement)
+        amount = _parse_decimal(movement.get("monto"))
+        if not references or amount is None:
+            continue
+        matches = [
+            bank_item for bank_item in later_bank_movements
+            if references & bank_item["referencias"] and amount == bank_item["monto"]
+        ]
+        matching_books = [
+            candidate for candidate in pending_books
+            if _parse_decimal((candidate.get("movimiento") or {}).get("monto")) == amount
+            and references & _movement_references(candidate.get("movimiento") or {})
+        ]
+        if len(matches) == 1 and len(matching_books) == 1:
+            bank_item = matches[0]
+            item["reflejado_en_periodo_posterior"] = {
+                "estado": "Reflejado en el banco en un período posterior",
+                "fecha": bank_item["fecha"],
+                "periodo": bank_item["periodo"],
+                "referencia": sorted(references & bank_item["referencias"])[0],
+                "importe_con_signo": str(bank_item["monto"]),
+                "evidencia": bank_item["evidencia"],
+            }
+
+
+def _validate_job_account(scope, job, requested_account_id=None, validate_result=True):
+    account_id = str(job.get("cuenta_id") or "").strip()
+    if not account_id:
+        raise ValidationError({"cuenta_id": "El trabajo no tiene una cuenta elegida. Conserva los documentos y vuelve a analizarlos después de seleccionarla."})
+    if requested_account_id and str(requested_account_id).strip() != account_id:
+        raise ValidationError({"cuenta_id": "No se puede reasignar un resultado calculado a otra cuenta. Selecciona la cuenta original o inicia un análisis nuevo."})
+    try:
+        UUID(account_id)
+    except ValueError as exc:
+        raise ValidationError({"cuenta_id": "El identificador de cuenta del trabajo no es válido."}) from exc
+
+    try:
+        with connection.cursor() as cursor:
+            account = _authorized_account(cursor, scope, account_id)
+            available_accounts = _authorized_accounts(cursor, scope)
+    except DatabaseError as exc:
+        raise DatabaseUnavailable() from exc
+    diagnostics = []
+    suggestion = job.get("vinculacion_cuenta")
+    if validate_result:
+        diagnostics, suggestion = _validate_account_result(
+            account,
+            available_accounts,
+            job.get("resultado") or {},
+            scope["country_code"],
+        )
+        if diagnostics:
+            raise ValidationError({
+                "cuenta_id": diagnostics[0]["mensaje"],
+                "diagnosticos": diagnostics,
+            })
+    return account, suggestion
 
 
 def _job_response(job_dir, job):
@@ -718,6 +1815,8 @@ def _job_response(job_dir, job):
         "periodo_sugerido": job.get("periodo_sugerido"),
         "cuenta_sugerida": job.get("cuenta_sugerida"),
         "cuenta_id": job.get("cuenta_id"),
+        "cuenta_seleccionada": job.get("cuenta_seleccionada"),
+        "vinculacion_cuenta": job.get("vinculacion_cuenta"),
         "banco_id": job.get("banco_id"),
         "pais_codigo": job.get("pais_codigo"),
         "empresa_id": job.get("empresa_id"),
@@ -741,14 +1840,19 @@ class DirectReconciliationListCreateView(APIView):
 
     def get(self, request):
         scope = _access(request)
-        root = _safe_scope_path(scope)
+        root = _scope_jobs_path(scope)
         cuenta_id = request.query_params.get("cuenta_id", "").strip()
         banco_id = request.query_params.get("banco_id", "").strip()
         jobs = []
         if root.exists():
-            for metadata in sorted(root.glob("*/metadata.json"), reverse=True):
+            for metadata in sorted(root.glob("*/*/metadata.json"), reverse=True):
                 try:
                     job = json.loads(metadata.read_text(encoding="utf-8"))
+                    if (
+                        job.get("empresa_id") != scope["company_id"]
+                        or job.get("pais_codigo") != scope["country_code"]
+                    ):
+                        continue
                     if cuenta_id and job.get("cuenta_id") != cuenta_id:
                         continue
                     if banco_id and job.get("banco_id") != banco_id:
@@ -764,10 +1868,30 @@ class DirectReconciliationListCreateView(APIView):
         return Response({"trabajos": jobs})
 
     def post(self, request):
-        scope = _access(request)
+        scope = _writer_access(request)
         country = request.data.get("pais_codigo", scope["country_code"])
         if country != scope["country_code"] or country not in ("GT", "SV"):
             raise ValidationError({"pais_codigo": "El país seleccionado no está autorizado para la sesión."})
+        account_id = str(request.data.get("cuenta_id") or "").strip()
+        if not account_id:
+            raise ValidationError({"cuenta_id": "Elige una cuenta autorizada antes de iniciar el análisis."})
+        try:
+            UUID(account_id)
+        except ValueError as exc:
+            raise ValidationError({"cuenta_id": "El identificador de cuenta no es válido."}) from exc
+        try:
+            with connection.cursor() as cursor:
+                selected_account = _authorized_account(cursor, scope, account_id)
+                available_accounts = _authorized_accounts(cursor, scope)
+        except DatabaseError as exc:
+            raise DatabaseUnavailable() from exc
+        requested_period = request.data.get("periodo")
+        if _is_cuscatlan_account(selected_account):
+            if not requested_period:
+                raise ValidationError({"periodo": "Selecciona el mes y año a conciliar para Banco Cuscatlán."})
+            _period_dates(requested_period)
+        else:
+            requested_period = None
         uploads = request.FILES.getlist("files")
         if not uploads:
             raise ValidationError({"files": "Adjunta al menos un documento."})
@@ -803,6 +1927,10 @@ class DirectReconciliationListCreateView(APIView):
             "empresa_id": scope["company_id"],
             "pais_codigo": country,
             "usuario_creador_id": scope["user_id"],
+            "cuenta_id": selected_account["id"],
+            "banco_id": selected_account["banco_id"],
+            "moneda_codigo": selected_account["moneda_codigo"],
+            "cuenta_seleccionada": selected_account,
             "estado": "analizando",
             "progreso": [
                 {"etapa": "recibiendo", "estado": "completo"},
@@ -816,12 +1944,25 @@ class DirectReconciliationListCreateView(APIView):
             "actualizado_en": now,
         }
         try:
-            resultado = _analyze_files(job_dir, country)
+            resultado = _analyze_files(job_dir, country, period=requested_period)
+            account_diagnostics, account_link = _validate_account_result(
+                selected_account,
+                available_accounts,
+                resultado,
+                country,
+            )
+            resultado["diagnosticos"].extend(account_diagnostics)
+            _historical_difference_evidence(
+                resultado, scope, selected_account, current_job_id=job_id
+            )
             estado = "preparado" if resultado["banco"] and resultado["libros"] and not resultado["diagnosticos"] else "requiere_aclaraciones"
             context = resultado["banco"]["reconocimiento"]["contexto"] if resultado["banco"] else {}
             job["estado"] = estado
-            job["periodo_sugerido"] = context.get("periodo_declarado")
+            job["periodo_sugerido"] = (
+                str(requested_period) if requested_period else context.get("periodo_declarado")
+            )
             job["resultado"] = resultado
+            job["vinculacion_cuenta"] = account_link
             job["progreso"] = [
                 {"etapa": "recibiendo", "estado": "completo"},
                 {"etapa": "leyendo", "estado": "completo"},
@@ -849,12 +1990,24 @@ class DirectReconciliationDetailView(APIView):
         scope = _access(request)
         job_dir = _job_path(scope, job_id)
         job = _read_json(job_dir / "metadata.json")
+        requested_account_id = request.query_params.get("cuenta_id")
+        if requested_account_id and requested_account_id != job.get("cuenta_id"):
+            raise ValidationError({"cuenta_id": "El trabajo no pertenece a la cuenta solicitada."})
+        result = job.get("resultado") or {}
+        if result.get("resumen") and result.get("proceso_conciliacion"):
+            result_context = result.setdefault("contexto_resultado", {})
+            if isinstance(result_context, dict):
+                result_context.setdefault("periodo", job.get("periodo_sugerido"))
+            _difference_explanation(result)
+            account = job.get("cuenta_seleccionada") or {
+                "id": job.get("cuenta_id"),
+                "moneda_codigo": job.get("moneda_codigo"),
+            }
+            _historical_difference_evidence(result, scope, account, current_job_id=job_id)
         return Response(_job_response(job_dir, job))
 
     def post(self, request, job_id):
-        scope = _access(request)
-        if scope.get("role") == "consulta":
-            raise PermissionDenied("El usuario consulta no puede modificar trabajos de conciliación.")
+        scope = _writer_access(request)
         job_dir = _job_path(scope, job_id)
         if not job_dir.exists():
             raise NotFound("El trabajo de conciliación no existe.")
@@ -863,58 +2016,104 @@ class DirectReconciliationDetailView(APIView):
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
 
+        if action == "vincular_numero":
+            if scope.get("role") != "administrador":
+                raise PermissionDenied("Solo un administrador puede confirmar el vínculo del número completo.")
+            account, suggestion = _validate_job_account(
+                scope,
+                job,
+                request.data.get("cuenta_id"),
+            )
+            if not suggestion:
+                if account.get("numero_completo_verificado"):
+                    return Response(_job_response(job_dir, job))
+                raise ValidationError({"cuenta_id": "No hay una coincidencia única de número completo para confirmar."})
+            full_number = suggestion["numero_completo"]
+            ending = suggestion["terminacion"]
+            if scope["country_code"] != "SV" or len(full_number) <= 4 or not full_number.endswith(ending):
+                raise ValidationError({"cuenta_id": "El número detectado no puede vincularse con seguridad a esta terminación."})
+            original_job = json.loads(json.dumps(job, ensure_ascii=False))
+            try:
+                with transaction.atomic():
+                    with connection.cursor() as cursor:
+                        cursor.execute("SELECT set_config('contared.actor_id', %s, true)", [scope["user_id"]])
+                        cursor.execute(
+                            """
+                            SELECT id::text,banco_id::text,numero,alias,moneda_codigo,numero_terminacion
+                            FROM contared.cuentas_bancarias
+                            WHERE id=%s AND empresa_id=%s AND pais_codigo='SV' AND activa IS TRUE
+                            FOR UPDATE
+                            """,
+                            [account["id"], scope["company_id"]],
+                        )
+                        current = cursor.fetchone()
+                        if current is None:
+                            raise ValidationError({"cuenta_id": "La cuenta dejó de estar activa o ya no pertenece al ámbito autorizado."})
+                        current_ending = _account_digits(current[5]) or _account_digits(current[2])
+                        if len(current_ending) != 4 or not full_number.endswith(current_ending):
+                            raise ValidationError({"cuenta_id": "La terminación operativa ya no coincide con el número detectado."})
+                        cursor.execute(
+                            """
+                            SELECT id::text FROM contared.cuentas_bancarias
+                            WHERE empresa_id=%s AND pais_codigo='SV' AND banco_id=%s
+                              AND moneda_codigo=%s AND btrim(numero)=btrim(%s) AND id<>%s
+                            LIMIT 1
+                            """,
+                            [scope["company_id"], current[1], current[4], full_number, account["id"]],
+                        )
+                        duplicate = cursor.fetchone()
+                        if duplicate:
+                            raise ValidationError({
+                                "cuenta_id": "Ya existe otra cuenta operativa con ese número completo. No se creó un duplicado; selecciona la cuenta existente e inicia un análisis nuevo."
+                            })
+                        cursor.execute(
+                            """
+                            UPDATE contared.cuentas_bancarias
+                            SET numero=%s,numero_terminacion=%s,numero_completo_verificado=true,
+                                incorporacion_provisional=false
+                            WHERE id=%s AND empresa_id=%s AND pais_codigo='SV'
+                            """,
+                            [full_number, current_ending, account["id"], scope["company_id"]],
+                        )
+                    account["numero"] = full_number
+                    account["numero_terminacion"] = current_ending
+                    account["numero_completo_verificado"] = True
+                    account["incorporacion_provisional"] = False
+                    job["cuenta_seleccionada"] = account
+                    job["vinculacion_cuenta"] = None
+                    job["resultado"]["contexto_resultado"]["cuenta_operativa"] = full_number
+                    job["actualizado_en"] = now
+                    _write_json(job_dir / "metadata.json", job)
+            except DatabaseError as exc:
+                _write_json(job_dir / "metadata.json", original_job)
+                raise DatabaseUnavailable() from exc
+            except OSError as exc:
+                _write_json(job_dir / "metadata.json", original_job)
+                raise ValidationError({"detail": "No se pudo guardar el vínculo; el cambio en la cuenta se revirtió."}) from exc
+            return Response(_job_response(job_dir, job))
+
         if action == "finalizar":
             original_job = json.loads(json.dumps(job, ensure_ascii=False))
-            requested_account_id = str(request.data.get("cuenta_id") or job.get("cuenta_id") or "").strip()
+            account, suggestion = _validate_job_account(
+                scope,
+                job,
+                request.data.get("cuenta_id"),
+            )
+            if job.get("estado") in ("finalizado_con_pendientes", "finalizado", "aprobado"):
+                return Response(_job_response(job_dir, job))
             contexto = job.get("resultado", {}).get("contexto_resultado", {})
-            account_number = str(contexto.get("cuenta") or contexto.get("numero_cuenta") or "").strip()
-            candidates = []
-            try:
-                with connection.cursor() as cursor:
-                    if requested_account_id:
-                        cursor.execute(
-                            """
-                            SELECT c.id::text,c.banco_id::text,c.numero,c.alias,c.moneda_codigo
-                            FROM contared.cuentas_bancarias c
-                            WHERE c.id=%s AND c.empresa_id=%s AND c.pais_codigo=%s
-                              AND c.activa IS TRUE
-                            """,
-                            [requested_account_id, scope["company_id"], scope["country_code"]],
-                        )
-                        row = cursor.fetchone()
-                        if row:
-                            candidates = [row]
-                    elif account_number:
-                        cursor.execute(
-                            """
-                            SELECT c.id::text,c.banco_id::text,c.numero,c.alias,c.moneda_codigo
-                            FROM contared.cuentas_bancarias c
-                            WHERE c.empresa_id=%s AND c.pais_codigo=%s AND c.activa IS TRUE
-                              AND btrim(c.numero)=btrim(%s)
-                            """,
-                            [scope["company_id"], scope["country_code"], account_number],
-                        )
-                        candidates = cursor.fetchall()
-            except Exception as exc:
-                raise ValidationError({"cuenta_id": "No se pudo validar la cuenta con el servidor."}) from exc
-            if requested_account_id and not candidates:
-                raise ValidationError({"cuenta_id": "La cuenta seleccionada no pertenece a la empresa, país y permisos autorizados."})
-            if not candidates and account_number:
-                raise ValidationError({"cuenta_id": "Pendiente de vincular: el resultado no coincide con una cuenta operativa única. Selecciona una cuenta."})
-            if len(candidates) > 1:
-                raise ValidationError({"cuenta_id": "La cuenta no puede determinarse de forma única. Selecciona una cuenta antes de guardar."})
-            if not candidates:
-                raise ValidationError({"cuenta_id": "Selecciona una cuenta antes de guardar la conciliación."})
-            job["cuenta_id"] = candidates[0][0]
-            job["banco_id"] = candidates[0][1]
-            job["moneda_codigo"] = candidates[0][4]
-            contexto["banco"] = str(contexto.get("banco") or "")
-            contexto["cuenta"] = str(candidates[0][2])
-            contexto["moneda"] = candidates[0][4]
+            job["cuenta_id"] = account["id"]
+            job["banco_id"] = account["banco_id"]
+            job["moneda_codigo"] = account["moneda_codigo"]
+            job["cuenta_seleccionada"] = account
+            job["vinculacion_cuenta"] = suggestion
+            contexto["cuenta_operativa"] = str(account["numero"])
+            contexto["moneda"] = account["moneda_codigo"]
             job.setdefault("resultado", {})["contexto_resultado"] = contexto
             resumen = job.get("resultado", {}).get("resumen", {})
             residual = resumen.get("diferencia_residual_pendiente")
-            job["estado"] = "finalizado_con_pendientes" if residual not in (None, "0.00", "0", 0) else "finalizado"
+            residual_amount = _parse_decimal(residual)
+            job["estado"] = "finalizado_con_pendientes" if residual_amount is None or residual_amount != 0 else "finalizado"
             job["responsable"] = scope["user_id"]
             job["responsable_nombre"] = scope.get("user_name")
             job["finalizado_en"] = now
@@ -936,58 +2135,69 @@ class DirectReconciliationDetailView(APIView):
             if isinstance(periodo_db, str) and len(periodo_db) == 7:
                 periodo_db = f"{periodo_db}-01"
             try:
-                with connection.cursor() as cursor:
-                    cursor.execute(
-                        """
-                        INSERT INTO contared.trabajos_conciliacion_directa
-                          (id,empresa_id,pais_codigo,usuario_creador_id,banco_id,cuenta_id,
-                           moneda_codigo,periodo_sugerido,estado,estado_historial,
-                           responsable_nombre,version,diferenciado_residual,vinculacion_estado,
-                           progreso,resultado,actualizado_en)
-                        VALUES
-                          (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,NOW())
-                        ON CONFLICT (id) DO UPDATE SET
-                          banco_id=EXCLUDED.banco_id,
-                          cuenta_id=EXCLUDED.cuenta_id,
-                          moneda_codigo=EXCLUDED.moneda_codigo,
-                          periodo_sugerido=EXCLUDED.periodo_sugerido,
-                          estado=EXCLUDED.estado,
-                          estado_historial=EXCLUDED.estado_historial,
-                          responsable_nombre=EXCLUDED.responsable_nombre,
-                          version=EXCLUDED.version,
-                          diferenciado_residual=EXCLUDED.diferenciado_residual,
-                          vinculacion_estado='vinculado',
-                          progreso=EXCLUDED.progreso,
-                          resultado=EXCLUDED.resultado,
-                          actualizado_en=NOW()
-                        """,
-                        [
-                            job_id, scope["company_id"], scope["country_code"], scope["user_id"],
-                            job["banco_id"], job["cuenta_id"], job["moneda_codigo"], periodo_db,
-                            job["estado"], job["estado"], scope.get("user_name"),
-                            int(job.get("version", 1)), str(residual or ""),
-                            "vinculado", json.dumps(job.get("progreso", []), ensure_ascii=False),
-                            json.dumps(job.get("resultado", {}), ensure_ascii=False),
-                        ],
-                    )
-            except Exception as exc:
-                raise ValidationError({"detail": "No se pudo persistir la conciliación vinculada en el servidor."}) from exc
-            try:
-                _write_json(job_dir / "metadata.json", job)
-            except Exception as exc:
-                try:
+                with transaction.atomic():
                     with connection.cursor() as cursor:
                         cursor.execute(
-                            "DELETE FROM contared.trabajos_conciliacion_directa WHERE id=%s AND empresa_id=%s AND pais_codigo=%s",
-                            [job_id, scope["company_id"], scope["country_code"]],
+                            """
+                            INSERT INTO contared.trabajos_conciliacion_directa
+                              (id,empresa_id,pais_codigo,usuario_creador_id,banco_id,cuenta_id,
+                               moneda_codigo,periodo_sugerido,estado,estado_historial,
+                               responsable_nombre,version,diferenciado_residual,vinculacion_estado,
+                               progreso,resultado,actualizado_en)
+                            VALUES
+                              (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,NOW())
+                            ON CONFLICT (id) DO UPDATE SET
+                              banco_id=EXCLUDED.banco_id,
+                              cuenta_id=EXCLUDED.cuenta_id,
+                              moneda_codigo=EXCLUDED.moneda_codigo,
+                              periodo_sugerido=EXCLUDED.periodo_sugerido,
+                              estado=EXCLUDED.estado,
+                              estado_historial=EXCLUDED.estado_historial,
+                              responsable_nombre=EXCLUDED.responsable_nombre,
+                              version=EXCLUDED.version,
+                              diferenciado_residual=EXCLUDED.diferenciado_residual,
+                              vinculacion_estado='vinculado',
+                              progreso=EXCLUDED.progreso,
+                              resultado=EXCLUDED.resultado,
+                              actualizado_en=NOW()
+                            """,
+                            [
+                                job_id, scope["company_id"], scope["country_code"], scope["user_id"],
+                                job["banco_id"], job["cuenta_id"], job["moneda_codigo"], periodo_db,
+                                job["estado"], job["estado"], scope.get("user_name"),
+                                int(job.get("version", 1)), str(residual or ""),
+                                "vinculado", json.dumps(job.get("progreso", []), ensure_ascii=False),
+                                json.dumps(job.get("resultado", {}), ensure_ascii=False),
+                            ],
                         )
-                except Exception:
-                    pass
+                    _write_json(job_dir / "metadata.json", job)
+            except DatabaseError as exc:
                 _write_json(job_dir / "metadata.json", original_job)
-                raise ValidationError({"detail": "No se pudo guardar el respaldo privado; se canceló también la persistencia de PostgreSQL."}) from exc
+                raise DatabaseUnavailable() from exc
+            except OSError as exc:
+                _write_json(job_dir / "metadata.json", original_job)
+                raise ValidationError({"detail": "No se pudo guardar el respaldo privado; el cambio en PostgreSQL se revirtió."}) from exc
             return Response(_job_response(job_dir, job))
 
         if action == "recalcular":
+            selected_account, _ = _validate_job_account(
+                scope,
+                job,
+                request.data.get("cuenta_id"),
+                validate_result=False,
+            )
+            requested_period = request.data.get("periodo")
+            if _is_cuscatlan_account(selected_account):
+                requested_period = (
+                    requested_period
+                    or (job.get("resultado") or {}).get("contexto_resultado", {}).get("periodo")
+                    or job.get("periodo_sugerido")
+                )
+                if not requested_period:
+                    raise ValidationError({"periodo": "Selecciona el mes y año a conciliar para Banco Cuscatlán."})
+                _period_dates(requested_period)
+            else:
+                requested_period = None
             replacement = request.FILES.getlist("files")
             source_files = replacement
             if not source_files:
@@ -1020,6 +2230,9 @@ class DirectReconciliationDetailView(APIView):
                 new_job = {
                     "id": new_id, "empresa_id": scope["company_id"], "pais_codigo": scope["country_code"],
                     "usuario_creador_id": scope["user_id"], "estado": "analizando",
+                    "cuenta_id": selected_account["id"], "banco_id": selected_account["banco_id"],
+                    "moneda_codigo": selected_account["moneda_codigo"],
+                    "cuenta_seleccionada": selected_account,
                     "progreso": [
                         {"etapa": "recibiendo", "estado": "completo"}, {"etapa": "leyendo", "estado": "en_curso"},
                         {"etapa": "identificando", "estado": "pendiente"}, {"etapa": "comparando", "estado": "pendiente"},
@@ -1030,9 +2243,22 @@ class DirectReconciliationDetailView(APIView):
                     "version_de": job_id,
                     "grupo_version": job.get("grupo_version", job_id),
                 }
-                resultado = _analyze_files(new_dir, scope["country_code"])
+                resultado = _analyze_files(
+                    new_dir, scope["country_code"], period=requested_period
+                )
+                account_diagnostics, account_link = _validate_account_result(
+                    selected_account,
+                    _authorized_accounts_for_scope(scope),
+                    resultado,
+                    scope["country_code"],
+                )
+                resultado["diagnosticos"].extend(account_diagnostics)
+                _historical_difference_evidence(
+                    resultado, scope, selected_account, current_job_id=new_id
+                )
                 new_job["resultado"] = resultado
                 new_job["estado"] = "preparado" if resultado["banco"] and resultado["libros"] and not resultado["diagnosticos"] else "requiere_aclaraciones"
+                new_job["vinculacion_cuenta"] = account_link
                 contexto = resultado.get("contexto_resultado", {})
                 periodo = contexto.get("periodo") or resultado["banco"].get("reconocimiento", {}).get("contexto", {}).get("periodo_declarado") if resultado["banco"] else None
                 banco = contexto.get("banco") or "Banco por confirmar"
@@ -1060,8 +2286,8 @@ class DirectReconciliationDetailView(APIView):
 
     def delete(self, request, job_id):
         scope = _access(request)
-        if scope.get("role") == "consulta":
-            raise PermissionDenied("El usuario consulta no puede eliminar trabajos de conciliación.")
+        if scope.get("role") != "administrador":
+            raise PermissionDenied("Solo un administrador puede eliminar definitivamente un trabajo.")
         job_dir = _job_path(scope, job_id)
         if not job_dir.exists():
             raise NotFound("El trabajo de conciliación no existe.")
@@ -1074,6 +2300,9 @@ class DirectReconciliationReportView(APIView):
         scope = _access(request)
         job_dir = _job_path(scope, job_id)
         job = _read_json(job_dir / "metadata.json")
+        requested_account_id = request.query_params.get("cuenta_id")
+        if requested_account_id and requested_account_id != job.get("cuenta_id"):
+            raise ValidationError({"cuenta_id": "El informe no pertenece a la cuenta solicitada."})
         result = job.get("resultado", {})
         report_format = request.query_params.get("formato", "xlsx")
         if report_format == "xlsx":
@@ -1091,19 +2320,18 @@ class DirectReconciliationReportView(APIView):
 
     def _pdf_summary(self, output, scope, job, result):
         summary = result.get("resumen", {}) if isinstance(result.get("resumen"), dict) else {}
-        proceso = result.get("proceso_conciliacion", {}) if isinstance(result.get("proceso_conciliacion"), dict) else {}
-        counts = proceso.get("conteos", {}) if isinstance(proceso.get("conteos"), dict) else {}
         context = result.get("contexto_resultado", {}) if isinstance(result.get("contexto_resultado"), dict) else {}
         bank_context = result.get("banco", {}).get("reconocimiento", {}).get("contexto", {}) if isinstance(result.get("banco"), dict) else {}
-        account = context.get("cuenta") or context.get("numero_cuenta") or bank_context.get("cuenta_bancaria") or "Por confirmar"
-        currency = context.get("moneda") or context.get("moneda_codigo") or bank_context.get("moneda_codigo") or "Por confirmar"
+        selected_account = job.get("cuenta_seleccionada") or {}
+        account = selected_account.get("numero") or context.get("cuenta") or context.get("numero_cuenta") or bank_context.get("cuenta_bancaria") or "Por confirmar"
+        currency = selected_account.get("moneda_codigo") or context.get("moneda") or context.get("moneda_codigo") or bank_context.get("moneda_codigo") or "Por confirmar"
         canonical_gt = CUENTAS_GT_CONFIRMADAS.get(str(account).strip()) if job.get("pais_codigo") == "GT" else None
         if canonical_gt:
             bank_name = canonical_gt[0]
             currency = canonical_gt[2]
         period = context.get("periodo") or bank_context.get("periodo_declarado") or job.get("periodo_sugerido") or "Por confirmar"
         cutoff = context.get("fecha_corte") or bank_context.get("cobertura_declarada", {}).get("hasta") or "Por confirmar"
-        bank_name = canonical_gt[0] if canonical_gt else context.get("banco") or ("Banco Industrial" if account == "0040040592" else "Por confirmar")
+        bank_name = canonical_gt[0] if canonical_gt else selected_account.get("banco") or context.get("banco") or ("Banco Industrial" if account == "0040040592" else "Por confirmar")
         company = "Red Intelfon"
 
         def format_period(value):
@@ -1121,10 +2349,11 @@ class DirectReconciliationReportView(APIView):
             amount = _parse_decimal(value)
             if amount is None:
                 return "Por confirmar"
-            formatted = f"{amount.quantize(Decimal('0.01')):,.2f}"
-            return f"Q{formatted}" if prefix and currency == "GTQ" else formatted
+            symbol = {"GTQ": "Q", "USD": "$"}.get(currency, "") if prefix else ""
+            sign = "-" if amount < 0 else ""
+            return f"{sign}{symbol}{abs(amount).quantize(Decimal('0.01')):,.2f}"
 
-        styles = getSampleSheetStyles = getSampleStyleSheet()
+        styles = getSampleStyleSheet()
         title = styles["Title"]
         title.textColor = colors.HexColor("#111827")
         body = styles["BodyText"]
@@ -1164,78 +2393,128 @@ class DirectReconciliationReportView(APIView):
         ]))
         story.extend([context_table, Spacer(1, 12)])
 
-        cifras = Table([[
-            Paragraph("<b>Saldo final Banco</b><br/><font size='14'>" + money(summary.get("saldo_final_banco")) + "</font>", body),
-            Paragraph("<b>Saldo final Contabilidad</b><br/><font size='14'>" + money(summary.get("saldo_final_contabilidad")) + "</font>", body),
-            Paragraph("<b>Diferencia residual</b><br/><font size='14'>" + money(summary.get("diferencia_residual_pendiente")) + "</font>", body),
-        ]], colWidths=[2.32*inch]*3)
-        cifras.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#FFFFFF")),
-            ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#E5E7EB")),
-            ("LINEBELOW", (2, 0), (2, 0), 3, colors.HexColor("#B91C1C")),
-            ("INNERGRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#E5E7EB")),
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("TOPPADDING", (0, 0), (-1, -1), 9), ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
-        ]))
-        story.extend([cifras, Spacer(1, 10)])
-        story.append(Paragraph(
-            f"<b>Puente:</b> diferencia original {money(summary.get('diferencia_original'))}. "
-            "Las partidas verificadas se presentan por separado; no se inventaron ajustes ni se forzó la igualdad.",
-            small,
-        ))
-        story.append(Spacer(1, 8))
-
-        partidas = summary.get("partidas_conciliatorias", [])
-        if partidas:
-            story.append(Paragraph("<b>Partidas conciliatorias explicativas</b>", body))
-            rows = [["Concepto", "Importe", "Lado", "Signo"]]
-            for partida in partidas[:8]:
-                rows.append([
-                    str(partida.get("concepto") or partida.get("tipo") or "Partida"),
-                    money(partida.get("importe")),
-                    str(partida.get("lado") or "Por confirmar"),
-                    str(partida.get("signo") or "Por confirmar"),
-                ])
-            table = Table(rows, colWidths=[3.15*inch, 1.45*inch, 1.1*inch, 1.2*inch], repeatRows=1)
-            table.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#7F1D1D")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#CBD5DF")),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"), ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        explanation = summary.get("explicacion_diferencia", {})
+        applied_items = explanation.get("residual", {}).get("partidas_aplicadas", [])
+        bank_balance = _parse_decimal(summary.get("saldo_final_banco"))
+        book_balance = _parse_decimal(summary.get("saldo_final_contabilidad"))
+        residual = _parse_decimal(summary.get("diferencia_residual_pendiente"))
+        red = colors.HexColor("#7F1D1D")
+        ink = colors.HexColor("#111827")
+        border = colors.HexColor("#E5E7EB")
+        muted = colors.HexColor("#4B5563")
+        heading = ParagraphStyle("ConciliacionHeading", parent=body, fontName="Helvetica-Bold", fontSize=12, leading=16, textColor=ink)
+        card_label = ParagraphStyle("ConciliacionCardLabel", parent=body, fontName="Helvetica-Bold", textColor=muted)
+        card_amount = ParagraphStyle("ConciliacionCardAmount", parent=body, fontName="Helvetica-Bold", fontSize=16, leading=20, textColor=ink)
+        card_width = 2.34 * inch
+        gap = 0.14 * inch
+        cards = []
+        for label, amount in (
+            ("Saldo final Banco", bank_balance),
+            ("Saldo final Contabilidad", book_balance),
+            ("Diferencia residual", residual),
+        ):
+            highlight = label == "Diferencia residual" and amount not in (None, 0)
+            amount_style = ParagraphStyle("ConciliacionResidualAmount", parent=card_amount, textColor=red) if highlight else card_amount
+            card = Table([[[Paragraph(label, card_label), Spacer(1, 4), Paragraph(money(amount), amount_style)]]], colWidths=[card_width])
+            card.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#FEF2F2" if highlight else "#F9FAFB")),
+                ("BOX", (0, 0), (-1, -1), 0.6, border),
+                ("LINEABOVE", (0, 0), (-1, 0), 2, red if highlight else border),
+                ("LEFTPADDING", (0, 0), (-1, -1), 12),
+                ("TOPPADDING", (0, 0), (-1, -1), 11),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 11),
             ]))
-            story.extend([table, Spacer(1, 8)])
-
-        count_table = Table([[
-            f"Cruces confirmados\n{counts.get('cruces_confirmados', 0)}",
-            f"Pendientes Banco\n{counts.get('pendientes_banco', 0)}",
-            f"Pendientes Contabilidad\n{counts.get('pendientes_contabilidad', 0)}",
-            f"Casos por aclarar\n{counts.get('alternativas_ambiguas', 0)}",
-        ]], colWidths=[1.74*inch]*4)
-        count_table.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F9FAFB")),
-            ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#111827")),
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"), ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"),
-            ("BOX", (0, 0), (-1, -1), 0.3, colors.HexColor("#C9D4DE")),
-            ("INNERGRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#C9D4DE")),
-            ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+            cards.append(card)
+        cifras = Table([[cards[0], "", cards[1], "", cards[2]]], colWidths=[card_width, gap, card_width, gap, card_width])
+        cifras.setStyle(TableStyle([
+            (command, (0, 0), (-1, -1), 0)
+            for command in ("LEFTPADDING", "RIGHTPADDING", "TOPPADDING", "BOTTOMPADDING")
         ]))
-        story.extend([Spacer(1, 6), count_table, Spacer(1, 8)])
+        story.extend([cifras, Spacer(1, 15)])
 
-        observations = [diagnosis.get("mensaje") for diagnosis in result.get("diagnosticos", []) if diagnosis.get("mensaje")]
-        story.append(Paragraph("<b>Observaciones esenciales</b>", body))
-        if observations:
-            story.append(Paragraph("<br/>".join(str(item) for item in observations[:3]), small))
+        item_types = {}
+        for item in summary.get("partidas_conciliatorias", []):
+            item_id = item.get("movimiento_id") or item.get("id")
+            if item_id is not None:
+                item_types[item_id] = item.get("tipo")
+
+        deposits = {"banco": Decimal("0.00"), "contabilidad": Decimal("0.00")}
+        checks = deposits.copy()
+        others = deposits.copy()
+        groups = {"deposito_transito": deposits, "cheque_historico_cobrado": checks}
+        effects_available = True
+        has_other_items = False
+        for item in applied_items:
+            effect = _parse_decimal(item.get("impacto_residual"))
+            side = str(item.get("lado") or "").strip().casefold()
+            if effect is None or side not in deposits:
+                effects_available = False
+                continue
+            group = groups.get(item_types.get(item.get("id")), others)
+            has_other_items |= group is others
+            # The residual is Banco minus Contabilidad.
+            group[side] += effect if side == "banco" else -effect
+
+        balanced_values = effects_available and all(value is not None for value in (bank_balance, book_balance, residual))
+        if balanced_values:
+            bank_subtotal = bank_balance + deposits["banco"]
+            book_subtotal = book_balance + deposits["contabilidad"]
+            adjusted_bank = bank_subtotal + checks["banco"] + others["banco"]
+            adjusted_books = book_subtotal + checks["contabilidad"] + others["contabilidad"]
+            balanced_values = (adjusted_bank - adjusted_books).quantize(Decimal("0.01")) == residual
+
+        rows = [
+            ["Concepto", "Contabilidad", "Banco", "Observación"],
+            ["Saldos finales", money(book_balance), money(bank_balance), Paragraph(f"Diferencia original de {money(summary.get('diferencia_original'))}.", small)],
+        ]
+        if balanced_values:
+            rows.extend([
+                ["Depósitos en circulación", money(deposits["contabilidad"]), money(deposits["banco"]), Paragraph(
+                    "Importes aplicados por lado." if any(deposits.values()) else "Sin depósitos aplicados.", small,
+                )],
+                ["Subtotal", money(book_subtotal), money(bank_subtotal), Paragraph("Saldos después de los depósitos aplicados.", small)],
+                ["Cheques en circulación", money(checks["contabilidad"]), money(checks["banco"]), Paragraph(
+                    "Cobros de cheques de períodos anteriores." if any(checks.values()) else "Sin partidas de cheques aplicadas.", small,
+                )],
+            ])
+            if has_other_items:
+                rows.append(["Otras partidas aplicadas", money(others["contabilidad"]), money(others["banco"]), Paragraph("Otras partidas verificadas aplicadas al saldo.", small)])
+            balance_label = "Saldo conciliado" if residual == 0 else "Saldo ajustado"
+            rows.append([balance_label, money(adjusted_books), money(adjusted_bank), Paragraph(
+                "Los saldos ajustados coinciden." if residual == 0 else "Queda una diferencia por conciliar.", small,
+            )])
         else:
-            story.append(Paragraph("No se detectaron aclaraciones esenciales adicionales en el resultado persistido.", small))
-        story.extend([Spacer(1, 14)])
+            rows.append(["Saldos ajustados", "—", "—", Paragraph("El resultado guardado no permite desglosar el ajuste por lado.", small)])
+        rows.append(["Diferencia residual", "", money(residual), Paragraph("Banco menos Contabilidad.", small)])
+
+        balance_table = Table(rows, colWidths=[1.82*inch, 1.15*inch, 1.15*inch, 3.18*inch])
+        balance_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), red),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTNAME", (0, -2), (-1, -1), "Helvetica-Bold"),
+            ("BACKGROUND", (0, -2), (-1, -2), colors.HexColor("#EAF4E8" if balanced_values and residual == 0 else "#F3F4F6")),
+            ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#FEF2F2" if residual not in (None, 0) else "#F9FAFB")),
+            ("ALIGN", (1, 0), (2, -1), "RIGHT"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("GRID", (0, 0), (-1, -1), 0.45, border),
+            ("TOPPADDING", (0, 0), (-1, -1), 7),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+        ]))
         signatures = Table([
-            ["", ""],
-            ["________________________________", "________________________________"],
-            ["Auxiliar", "Contador general"],
-        ], colWidths=[3.45*inch, 3.45*inch])
-        signatures.setStyle(TableStyle([("ALIGN", (0, 0), (-1, -1), "CENTER"), ("TOPPADDING", (0, 0), (-1, -1), 3)]))
-        story.append(signatures)
+            ["", "", ""],
+            ["Auxiliar de Contabilidad", "", "Contador General"],
+            ["Nombre y firma", "", "Nombre y firma"],
+        ], colWidths=[3.18*inch, 0.94*inch, 3.18*inch], rowHeights=[31, 16, 14])
+        signatures.setStyle(TableStyle([
+            ("LINEABOVE", (0, 1), (0, 1), 0.6, muted),
+            ("LINEABOVE", (2, 1), (2, 1), 0.6, muted),
+            ("ALIGN", (0, 1), (-1, -1), "CENTER"),
+            ("FONTNAME", (0, 1), (-1, 1), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 2), (-1, 2), 8),
+            ("TEXTCOLOR", (0, 2), (-1, 2), muted),
+        ]))
+        story.append(KeepTogether([Paragraph("Cuadro de conciliación", heading), Spacer(1, 6), balance_table, signatures]))
 
         doc = SimpleDocTemplate(output, pagesize=letter, leftMargin=0.45*inch, rightMargin=0.45*inch,
                                 topMargin=0.4*inch, bottomMargin=0.45*inch, title="Resumen de conciliación")
@@ -1335,12 +2614,13 @@ class DirectReconciliationReportView(APIView):
         border = Border(bottom=Side(style="thin", color="CBD5DF"))
         context = result.get("contexto_resultado", {}) if isinstance(result.get("contexto_resultado"), dict) else {}
         bank_context = result.get("banco", {}).get("reconocimiento", {}).get("contexto", {}) if isinstance(result.get("banco"), dict) else {}
-        account = context.get("cuenta") or context.get("numero_cuenta") or bank_context.get("cuenta_bancaria") or "Por confirmar"
-        currency = context.get("moneda") or context.get("moneda_codigo") or bank_context.get("moneda_codigo") or "Por confirmar"
+        selected_account = job.get("cuenta_seleccionada") or {}
+        account = selected_account.get("numero") or context.get("cuenta") or context.get("numero_cuenta") or bank_context.get("cuenta_bancaria") or "Por confirmar"
+        currency = selected_account.get("moneda_codigo") or context.get("moneda") or context.get("moneda_codigo") or bank_context.get("moneda_codigo") or "Por confirmar"
         canonical_gt = CUENTAS_GT_CONFIRMADAS.get(str(account).strip()) if job.get("pais_codigo") == "GT" else None
         if canonical_gt:
             currency = canonical_gt[2]
-        bank_name = canonical_gt[0] if canonical_gt else context.get("banco") or ("Banco Industrial" if account == "0040040592" else "Por confirmar")
+        bank_name = canonical_gt[0] if canonical_gt else selected_account.get("banco") or context.get("banco") or ("Banco Industrial" if account == "0040040592" else "Por confirmar")
         period = context.get("periodo") or bank_context.get("periodo_declarado") or job.get("periodo_sugerido") or "Por confirmar"
         cutoff = context.get("fecha_corte") or bank_context.get("cobertura_declarada", {}).get("hasta") or "Por confirmar"
         company = "Red Intelfon"
@@ -1450,6 +2730,61 @@ class DirectReconciliationReportView(APIView):
                 summary_sheet.cell(offset, 2).number_format = amount_format
                 summary_sheet.cell(offset, 3, partida.get("lado"))
                 summary_sheet.cell(offset, 4, partida.get("signo"))
+
+        explanation = summary.get("explicacion_diferencia", {})
+        original_detail = explanation.get("diferencia_original", {})
+        detail_rows = [
+            ["Cálculo aritmético", "", "", "Saldo final Banco", _parse_decimal(original_detail.get("saldo_banco")), "", "No aplicado", "", "Saldo Banco − Saldo Contabilidad"],
+            ["Cálculo aritmético", "", "", "Saldo final Contabilidad", _parse_decimal(original_detail.get("saldo_contabilidad")), "", "No aplicado", "", "Saldo reportado por el mayor"],
+            ["Cálculo aritmético", "", "", "Diferencia original", _parse_decimal(original_detail.get("importe")), "", "No aplicado", "", original_detail.get("formula")],
+            ["Residual", "", "", "Impacto total aplicado", _parse_decimal(explanation.get("residual", {}).get("impacto_total_aplicado")), "", "Aplicado", "", ""],
+            ["Residual", "", "", "Diferencia residual", _parse_decimal(explanation.get("residual", {}).get("importe")), "", "Resultado", "", explanation.get("residual", {}).get("mensaje_sin_partidas") or ""],
+        ]
+        for item in explanation.get("partidas_explicativas", []):
+            evidence = item.get("evidencia") or {}
+            source = evidence.get("banco") or evidence.get("historico") or {}
+            source_text = " · ".join(str(source.get(key)) for key in ("archivo", "hoja", "fila") if source.get(key))
+            detail_rows.append([
+                "Partida explicativa", "", "", item.get("concepto"),
+                _parse_decimal(item.get("importe_con_signo")), item.get("lado"),
+                "Afecta residual" if item.get("afecta_residual") else "No afecta residual",
+                "Verificada" if item.get("verificada") else "Pendiente",
+                " · ".join(filter(None, (item.get("motivo"), source_text))),
+            ])
+        for side, label in (("banco", "Banco"), ("contabilidad", "Contabilidad")):
+            side_data = explanation.get("pendientes", {}).get(side, {})
+            detail_rows.append(["Neto pendiente", "", "", f"Neto {label}", _parse_decimal(side_data.get("neto")), label, "No aplicado", "Pendiente", "Suma firmada de movimientos sin contraparte inequívoca"])
+            for item in side_data.get("movimientos", []):
+                evidence = item.get("evidencia") or {}
+                source = " · ".join(str(evidence.get(key)) for key in ("archivo", "hoja", "fila") if evidence.get(key))
+                detail_rows.append([
+                    "Movimiento pendiente", item.get("id"), item.get("fecha"), item.get("referencia"),
+                    _parse_decimal(item.get("importe_con_signo")), label, "No aplicado", "Pendiente",
+                    " · ".join(filter(None, (item.get("descripcion"), source))),
+                ])
+        for candidate in explanation.get("candidatos", []):
+            for side in ("banco", "contabilidad"):
+                for movement in candidate.get(side, []):
+                    source = movement.get("evidencia") or {}
+                    source_text = " · ".join(str(source.get(key)) for key in ("archivo", "hoja", "fila") if source.get(key))
+                    detail_rows.append([
+                        "Candidato por revisar", movement.get("id"), movement.get("movimiento", {}).get("fecha"),
+                        movement.get("movimiento", {}).get("referencia"),
+                        _parse_decimal(movement.get("movimiento", {}).get("monto")),
+                        "Banco" if side == "banco" else "Contabilidad", "No aplicado", "Requiere revisión",
+                        " · ".join(filter(None, (candidate.get("criterio"), candidate.get("explicacion"), source_text))),
+                    ])
+        difference_sheet = workbook.create_sheet("Detalle de diferencia")
+        detail_header_row = prepare_sheet(
+            difference_sheet,
+            "Detalle de diferencia",
+            context_rows,
+            ["Sección", "ID movimiento", "Fecha", "Concepto / referencia", "Importe con signo", "Lado", "Efecto residual", "Estado", "Motivo / evidencia"],
+            [24, 20, 14, 34, 20, 18, 20, 20, 64],
+            detail_rows,
+        )
+        for row_number in range(detail_header_row + 1, detail_header_row + len(detail_rows) + 1):
+            difference_sheet.cell(row_number, 5).number_format = amount_format
 
         process_headers = [
             "Fecha Banco", "Referencia Banco", "Descripción Banco", "Monto Banco",
@@ -1674,3 +3009,21 @@ class DirectReconciliationReportView(APIView):
         output = BytesIO()
         workbook.save(output)
         return output
+
+
+class DirectReconciliationSourceView(APIView):
+    def get(self, request, job_id, filename):
+        scope = _access(request)
+        job_dir = _job_path(scope, job_id)
+        job = _read_json(job_dir / "metadata.json")
+        requested_account_id = request.query_params.get("cuenta_id")
+        if requested_account_id and requested_account_id != job.get("cuenta_id"):
+            raise ValidationError({"cuenta_id": "El archivo no pertenece a la cuenta solicitada."})
+        safe_name = Path(filename).name
+        if safe_name != filename or safe_name not in {item.get("nombre") for item in job.get("archivos", [])}:
+            raise NotFound("El archivo de origen no pertenece a este trabajo.")
+        source = job_dir / "originales" / safe_name
+        if not source.is_file():
+            raise NotFound("El archivo original ya no está disponible.")
+        content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if source.suffix.lower() == ".xlsx" else "application/vnd.ms-excel"
+        return FileResponse(source.open("rb"), as_attachment=True, filename=safe_name, content_type=content_type)
