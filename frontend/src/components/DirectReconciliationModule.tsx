@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { Session } from "@supabase/supabase-js";
 import "./DirectReconciliationModule.css";
-import ReconciliationDashboard from "./ReconciliationDashboard";
+import ReconciliationDashboard, { type SourceLocation, type SourceRow } from "./ReconciliationDashboard";
 
 type Props = {
   session: Session;
@@ -148,6 +148,8 @@ export default function DirectReconciliationModule(props: Props) {
   ]);
   const fileInput = useRef<HTMLInputElement>(null);
   const replaceInput = useRef<HTMLInputElement>(null);
+  const closureReplaceInput = useRef<HTMLInputElement>(null);
+  const closureReplacementName = useRef<string | undefined>(undefined);
   const replacingIndex = useRef<number | null>(null);
   const storageKey = `contared-direct-${props.session.user.id}-${props.companyId}-${props.countryCode}`;
   const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "");
@@ -482,6 +484,23 @@ export default function DirectReconciliationModule(props: Props) {
       .catch((error: unknown) => setApiError(error instanceof Error ? error.message : "No se pudo descargar el PDF."));
   }
 
+  async function readSourceRow(source: SourceLocation): Promise<SourceRow> {
+    if (!activeJobId || !activeJobAccountId || !apiBaseUrl) throw new Error("La fila de origen no está disponible.");
+    const params = new URLSearchParams({
+      empresa_id: props.companyId,
+      pais_codigo: props.countryCode,
+      cuenta_id: activeJobAccountId,
+      hoja: source.hoja,
+      fila: String(source.fila),
+    });
+    const response = await fetch(
+      `${apiBaseUrl}/api/v1/conciliaciones-directas/trabajos/${activeJobId}/archivos/${encodeURIComponent(source.archivo)}/?${params}`,
+      { headers: { ...authHeaders, Accept: "application/json" } },
+    );
+    if (!response.ok) throw new Error(await responseError(response, "No se pudo leer la fila de origen."));
+    return await response.json() as SourceRow;
+  }
+
   async function downloadSource(filename: string) {
     if (!activeJobId || !activeJobAccountId || !apiBaseUrl) return;
     const params = new URLSearchParams({ empresa_id: props.companyId, pais_codigo: props.countryCode, cuenta_id: activeJobAccountId });
@@ -534,7 +553,7 @@ export default function DirectReconciliationModule(props: Props) {
     }
   }
 
-  async function recalculateJob(jobId = activeJobId, accountId = activeJobAccountId) {
+  async function recalculateJob(jobId = activeJobId, accountId = activeJobAccountId, replacementFiles?: File[], replacementName?: string) {
     if (!jobId || !apiBaseUrl) return;
     if (!window.confirm("Se sustituirá el resultado visible solo cuando termine el recálculo. El resultado anterior se conservará si ocurre un fallo.")) return;
     setApiError("");
@@ -546,7 +565,10 @@ export default function DirectReconciliationModule(props: Props) {
       form.append("cuenta_id", accountId);
       form.append("accion", "recalcular");
       if (isCuscatlanAccount(selectedAccount)) form.append("periodo", selectedPeriod);
-      if (props.mode === "new") documentFiles.forEach((file) => form.append("files", file));
+      if (replacementFiles) {
+        replacementFiles.forEach((file) => form.append("files", file));
+        if (replacementName) form.append("reemplazar_archivo", replacementName);
+      } else if (props.mode === "new") documentFiles.forEach((file) => form.append("files", file));
       const response = await fetch(`${apiBaseUrl}/api/v1/conciliaciones-directas/trabajos/${jobId}/`, {
         method: "POST",
         headers: authHeaders,
@@ -565,6 +587,76 @@ export default function DirectReconciliationModule(props: Props) {
     } catch (error: unknown) {
       setStage("idle");
       setApiError(error instanceof Error ? error.message : "El recálculo falló; se conservó el resultado anterior.");
+    }
+
+  }
+
+  async function resolveClosingBalance(resolution: { tipo: "confirmar" | "manual"; saldo?: string; motivo?: string }) {
+    if (!activeJobId || !apiBaseUrl) return;
+    setApiError("");
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/v1/conciliaciones-directas/trabajos/${activeJobId}/`, {
+        method: "POST",
+        headers: { ...authHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          empresa_id: props.companyId,
+          pais_codigo: props.countryCode,
+          cuenta_id: activeJobAccountId,
+          accion: "resolver_cierre",
+          tipo: resolution.tipo,
+          saldo_confirmado: resolution.saldo,
+          motivo: resolution.motivo,
+          moneda: selectedAccount?.moneda_codigo,
+        }),
+      });
+      if (!response.ok) throw new Error(await responseError(response, `No se pudo guardar la resolución del cierre (HTTP ${response.status}).`));
+      const job = await response.json() as { id: string; estado: string; resultado?: Record<string, any> };
+      setActiveResult(job.resultado ?? {});
+      setStage(job.estado === "requiere_aclaraciones" ? "clarifications" : "complete");
+      setHistoryJobs((current) => current.map((item) => String(item.id) === activeJobId ? { ...item, estado: job.estado, resultado: job.resultado } : item));
+    } catch (error: unknown) {
+      setApiError(error instanceof Error ? error.message : "No se pudo guardar la resolución del cierre.");
+    }
+  }
+
+  function openClosingFileReplacement(filename?: string) {
+    if (props.mode === "new" && filename) {
+      const index = documents.findIndex((item) => item.name === filename);
+      if (index >= 0) {
+        replacingIndex.current = index;
+        replaceInput.current?.click();
+        return;
+      }
+    }
+    closureReplacementName.current = filename;
+    closureReplaceInput.current?.click();
+  }
+
+  async function confirmObservation(index: number, code: string) {
+    if (!activeJobId || !activeJobAccountId || !apiBaseUrl || savingRef.current) return;
+    savingRef.current = true;
+    setSaving(true);
+    setApiError("");
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/v1/conciliaciones-directas/trabajos/${activeJobId}/`, {
+        method: "POST",
+        headers: { ...authHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          empresa_id: props.companyId,
+          pais_codigo: props.countryCode,
+          cuenta_id: activeJobAccountId,
+          accion: "confirmar_revision",
+          indice: index,
+          codigo: code,
+        }),
+      });
+      const job = await jsonResponse(response, "No se pudo guardar la confirmación de revisión.");
+      setActiveResult(job.resultado as Record<string, any>);
+    } catch (error: unknown) {
+      setApiError(error instanceof Error ? error.message : "No se pudo guardar la confirmación de revisión.");
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
     }
   }
 
@@ -630,6 +722,11 @@ export default function DirectReconciliationModule(props: Props) {
     return <section className="direct-module">
       <header><p className="eyebrow">CONCILIACIONES</p><h1>Conciliaciones de la cuenta o banco</h1>{props.cuentaId && <button type="button" className="quiet-button" onClick={props.onBackToAccount}>Volver a la cuenta</button>}{props.bancoId && <button type="button" className="quiet-button" onClick={props.onBackToBank}>Volver al banco</button>}</header>
       {apiError && <div className="notice error" role="alert"><span>{apiError}</span><button type="button" className="quiet-button" onClick={() => window.location.reload()}>Reintentar</button></div>}
+      <input ref={closureReplaceInput} hidden type="file" accept=".xlsx,.xls" onChange={(event) => {
+        const file = event.target.files?.[0];
+        if (file) void recalculateJob(activeJobId, activeJobAccountId, [file], closureReplacementName.current).catch((error: unknown) => setApiError(error instanceof Error ? error.message : "No se pudo reemplazar el archivo."));
+        event.currentTarget.value = "";
+      }} />
       {activeResult && <ReconciliationDashboard
         result={activeResult}
         job={historyJobs.find((item) => String(item.id) === activeJobId)}
@@ -642,8 +739,13 @@ export default function DirectReconciliationModule(props: Props) {
         onDownloadPdf={downloadPdf}
         onPrint={() => window.print()}
         onRecalculate={() => void recalculateJob(activeJobId)}
+        canEdit={props.role === "administrador" || props.role === "auxiliar"}
+        onResolveClosingBalance={resolveClosingBalance}
+        onConfirmObservation={confirmObservation}
+        onReplaceClosingFile={openClosingFileReplacement}
         onOpenPreviousReconciliation={(jobId, accountId) => void openPreviousReconciliation(jobId, accountId)}
         onOpenSource={(filename) => void downloadSource(filename).catch((error: unknown) => setApiError(error instanceof Error ? error.message : "No se pudo abrir el documento de origen."))}
+        onReadSourceRow={readSourceRow}
       />}
       <div className="direct-card">
         {!historyJobs.length ? <p>No hay trabajos registrados en el servidor para este usuario, empresa y país.</p> : <ul className="document-list">
@@ -760,7 +862,7 @@ export default function DirectReconciliationModule(props: Props) {
 
     {activeResult && <ReconciliationDashboard
       result={activeResult}
-      job={{ id: activeJobId, cuenta_id: activeJobAccountId, cuenta_seleccionada: selectedAccount, estado: stage === "complete" ? "preparado" : "requiere_aclaraciones", responsable_nombre: undefined, finalizado_en: undefined, actualizado_en: undefined }}
+      job={{ id: activeJobId, cuenta_id: activeJobAccountId, cuenta_seleccionada: selectedAccount, estado: stage === "clarifications" ? "requiere_aclaraciones" : stage === "complete" ? "preparado" : undefined, responsable_nombre: undefined, finalizado_en: undefined, actualizado_en: undefined }}
       companyName={props.companyName}
       countryCode={props.countryCode}
       saved={Boolean(dashboardReturnState)}
@@ -773,8 +875,13 @@ export default function DirectReconciliationModule(props: Props) {
       onDownloadPdf={downloadPdf}
       onPrint={() => window.print()}
       onRecalculate={() => void recalculateJob()}
+      canEdit={props.role === "administrador" || props.role === "auxiliar"}
+      onResolveClosingBalance={resolveClosingBalance}
+      onConfirmObservation={confirmObservation}
+      onReplaceClosingFile={openClosingFileReplacement}
       onOpenPreviousReconciliation={(jobId, accountId) => void openPreviousReconciliation(jobId, accountId)}
       onOpenSource={(filename) => void downloadSource(filename).catch((error: unknown) => setApiError(error instanceof Error ? error.message : "No se pudo abrir el documento de origen."))}
+      onReadSourceRow={readSourceRow}
     />}
     {activeResult && false && (stage === "complete" || stage === "clarifications") && (() => {
       const result = activeResult!;
@@ -844,9 +951,9 @@ export default function DirectReconciliationModule(props: Props) {
       </div>;
     })()}
 
-    {stage === "clarifications" && <div className="direct-card clarifications">
-      <h2>Requiere aclaraciones</h2>
-      <p>El análisis determinístico terminó con diagnósticos concretos del servidor. No se aprobarán cruces ni ajustes hasta resolverlos.</p>
+    {stage === "clarifications" && !activeResult && <div className="direct-card clarifications">
+      <h2>Revisión pendiente</h2>
+      <p>Revisá los documentos cargados antes de continuar.</p>
     </div>}
   </section>;
 }

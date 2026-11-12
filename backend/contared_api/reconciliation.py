@@ -209,20 +209,25 @@ def _pair_components(bank_movements, book_movements, predicate, candidate_key):
     return components
 
 
-def _group_components(bank_movements, book_movements):
-    by_reference_date_bank = defaultdict(list)
-    by_reference_date_books = defaultdict(list)
-    for movement in bank_movements:
-        if movement.reference:
-            by_reference_date_bank[(movement.reference, movement.transaction_date)].append(movement)
-    for movement in book_movements:
-        if movement.reference:
-            by_reference_date_books[(movement.reference, movement.transaction_date)].append(movement)
+def suggest_same_day_groups(bank_movements, book_movements):
+    """Find reviewable one-to-many groups without requiring a shared reference."""
+    return _group_components(bank_movements, book_movements, same_day_only=True)
+
+
+def _group_components(bank_movements, book_movements, *, same_day_only=False):
+    bank_groups = defaultdict(list)
+    book_groups = defaultdict(list)
+    for movements, groups in ((bank_movements, bank_groups), (book_movements, book_groups)):
+        for movement in movements:
+            if same_day_only and movement.amount != 0:
+                groups[(movement.transaction_date, movement.amount > 0)].append(movement)
+            elif not same_day_only and movement.reference:
+                groups[(movement.reference, movement.transaction_date)].append(movement)
 
     result = []
-    for key in by_reference_date_bank.keys() & by_reference_date_books.keys():
-        banks = by_reference_date_bank[key]
-        books = by_reference_date_books[key]
+    for key in bank_groups.keys() & book_groups.keys():
+        banks = bank_groups[key]
+        books = book_groups[key]
         candidates = []
         search_exceeded = False
         combinations_examined = 0

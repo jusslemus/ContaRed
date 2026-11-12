@@ -9,6 +9,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from uuid import UUID, uuid4
 from xml.etree.ElementTree import ParseError
 from xml.sax.saxutils import escape
@@ -33,8 +34,11 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from contared_api.banking import CUENTAS_GT_CONFIRMADAS, CUENTAS_SV_CONFIRMADAS, scope_from_request
-from contared_api.imports import _normalize_xls, recognize_workbook, validate_workbook
-from contared_api.reconciliation import Movement, propose_reconciliation
+from contared_api.imports import (
+    MAX_COLUMNS, MAX_DATA_ROWS, _normalize_xls, _normalized_header,
+    parse_decimal, recognize_workbook, validate_workbook,
+)
+from contared_api.reconciliation import Movement, propose_reconciliation, suggest_same_day_groups
 from contared_api.session_access import DatabaseUnavailable
 
 
@@ -108,6 +112,54 @@ def _parse_decimal(value):
         return number if number.is_finite() else None
     except (InvalidOperation, ValueError):
         return None
+
+
+def _apply_closure_resolution(result, *, method, confirmed_balance, reason, scope, resolved_at):
+    summary = result.get("resumen")
+    if not isinstance(summary, dict):
+        raise ValidationError({"cierre": "El análisis no tiene un resumen disponible para resolver el cierre bancario."})
+    confirmed = _parse_decimal(confirmed_balance)
+    detected = _parse_decimal(
+        summary.get("saldo_final_banco_detectado", summary.get("saldo_final_banco"))
+    )
+    if confirmed is None or detected is None:
+        raise ValidationError({"saldo_confirmado": "El saldo confirmado debe ser un importe numérico y debe existir un saldo detectado."})
+    ledger = _parse_decimal(summary.get("saldo_final_contabilidad"))
+    if ledger is None:
+        raise ValidationError({"cierre": "No se puede recalcular el cierre sin saldo final de Contabilidad."})
+    original_difference = (confirmed - ledger).quantize(Decimal("0.01"))
+    source = summary.get("saldo_final_banco_fuente")
+    if not isinstance(source, dict):
+        source = (
+            result.get("banco", {})
+            .get("reconocimiento", {})
+            .get("contexto", {})
+            .get("saldo_final_observado_evidencia")
+        )
+    resolution = {
+        "estado": "resuelto",
+        "tipo": method,
+        "saldo_detectado": str(detected),
+        "saldo_confirmado": str(confirmed),
+        "origen": source or {},
+        "motivo": reason or None,
+        "usuario_id": scope["user_id"],
+        "usuario_nombre": scope.get("user_name"),
+        "resuelto_en": resolved_at,
+    }
+    summary["saldo_final_banco_detectado"] = str(detected)
+    summary["saldo_final_banco_fuente"] = source or {}
+    summary["saldo_final_banco"] = str(confirmed)
+    summary["diferencia_original"] = str(original_difference)
+    summary["cierre_bancario"] = resolution
+    summary["cobertura_periodo_bancario"] = "verificada"
+    for diagnostic in result.get("diagnosticos", []):
+        if diagnostic.get("codigo") == "cobertura_bancaria_incierta":
+            diagnostic["estado"] = "resuelto"
+            diagnostic["resuelto"] = True
+            diagnostic["resolucion"] = resolution
+    _difference_explanation(result)
+    return resolution
 
 
 def _account_digits(value):
@@ -1281,8 +1333,36 @@ def _analyze_files(job_dir, country_code, period=None):
 
     _dashboard_sections(result)
     final_bank = None
+    bank_context = bank["reconocimiento"]["contexto"] if bank else {}
+    final_bank_source = bank_context.get("saldo_final_observado_evidencia")
     if bank and bank["movimientos"]:
-        final_bank = _parse_decimal(bank["movimientos"][-1].get("saldo_origen"))
+        closing_movement = bank["movimientos"][-1]
+        if country_code == "GT" and bank["reconocimiento"].get("perfil_sugerido") == "banco_gt_banrural":
+            # Banrural reports the available balance separately from the running ledger balance.
+            available = next(
+                (value for header, value in closing_movement["datos_originales"].items()
+                 if _normalized_header(header) == "saldo disponible"),
+                None,
+            )
+            final_bank_source = {
+                "archivo": closing_movement["datos_originales"]["archivo"],
+                "hoja": closing_movement["datos_originales"]["hoja"],
+                "fila": closing_movement["fila_origen"],
+                "fecha": closing_movement["fecha"],
+                "columna": "Saldo disponible",
+            }
+            try:
+                final_bank = parse_decimal(available, "saldo disponible")
+            except ValueError:
+                final_bank = None
+            if final_bank is None:
+                result["diagnosticos"].append({
+                    "codigo": "saldo_disponible_bancario_faltante",
+                    "archivo": final_bank_source["archivo"],
+                    "mensaje": f"No se pudo leer el Saldo disponible de Banrural en la fila {final_bank_source['fila']}.",
+                })
+        else:
+            final_bank = _parse_decimal(closing_movement.get("saldo_origen"))
     final_ledger = None
     if ledger and ledger["movimientos"]:
         final_ledger = _parse_decimal(ledger["movimientos"][-1].get("saldo_origen"))
@@ -1343,6 +1423,8 @@ def _analyze_files(job_dir, country_code, period=None):
     proceso = result.get("proceso_conciliacion", {})
     result["resumen"] = {
         "saldo_final_banco": str(final_bank) if final_bank is not None else None,
+        "saldo_final_banco_detectado": str(final_bank) if final_bank is not None else None,
+        "saldo_final_banco_fuente": final_bank_source,
         "saldo_inicial_banco": (
             bank.get("saldo_inicial") if bank and bank.get("saldo_inicial") is not None else None
         ),
@@ -1357,6 +1439,7 @@ def _analyze_files(job_dir, country_code, period=None):
         "diferencia_original": str(original_difference) if original_difference is not None else None,
         "partidas_conciliatorias": partidas,
         "diferencia_residual_pendiente": str(residual) if residual is not None else None,
+        "cierre_bancario": None,
         "controles": {
             "movimientos_banco": movements_bank,
             "movimientos_contabilidad": movements_ledger,
@@ -1394,6 +1477,38 @@ def _analyze_files(job_dir, country_code, period=None):
     return result
 
 
+def _same_day_group_candidates(bank_pending, books_pending, excluded_ids):
+    items_by_id = {}
+    sides = {"bank": [], "books": []}
+    for side, pending in (("bank", bank_pending), ("books", books_pending)):
+        for item in pending["movimientos"]:
+            identifier = item.get("id")
+            amount = _parse_decimal(item.get("importe_con_signo"))
+            if not identifier or identifier in excluded_ids or item.get("grupo_reversion_id") or amount is None:
+                continue
+            try:
+                movement_date = date.fromisoformat(str(item.get("fecha")))
+            except ValueError:
+                continue
+            sides[side].append(Movement(identifier, "direct", side, movement_date, amount))
+            items_by_id[identifier] = item
+
+    return [
+        {
+            "tipo": "agrupacion_ambigua" if ambiguous else "agrupacion_fecha_suma",
+            "criterio": "Misma fecha y suma exacta",
+            "explicacion": (
+                "Hay varias combinaciones posibles o el volumen supera el límite de búsqueda. Requiere revisión."
+                if ambiguous else
+                "Estas filas del mismo día suman el mismo importe en ambos lados. Revisa las referencias antes de confirmar."
+            ),
+            "banco": [items_by_id[item_id] for item_id in bank_ids],
+            "contabilidad": [items_by_id[item_id] for item_id in book_ids],
+        }
+        for (bank_ids, book_ids), ambiguous in suggest_same_day_groups(sides["bank"], sides["books"])
+    ]
+
+
 def _difference_explanation(result):
     summary = result.get("resumen", {})
     proceso = result.get("proceso_conciliacion", {})
@@ -1409,6 +1524,7 @@ def _difference_explanation(result):
             effect = Decimal("0.00")
         item = {
             "id": partida.get("movimiento_id", partida.get("id")),
+            "tipo": partida.get("tipo"),
             "concepto": partida.get("concepto") or partida.get("tipo") or "Partida",
             "importe_con_signo": str(amount) if amount is not None else None,
             "lado": partida.get("lado") or "No identificado",
@@ -1517,6 +1633,15 @@ def _difference_explanation(result):
                     for index, movement in zip(group.get("contabilidad_indices", []), group.get("contabilidad", []))
                 ],
             })
+
+    excluded_ids = {
+        item["id"]
+        for candidate in candidates
+        for side in ("banco", "contabilidad")
+        for item in candidate.get(side, [])
+        if item.get("id")
+    }
+    candidates.extend(_same_day_group_candidates(bank_pending, books_pending, excluded_ids))
 
     bank_context = ((result.get("banco") or {}).get("reconocimiento") or {}).get("contexto") or {}
     ledger_context = ((result.get("libros") or {}).get("reconocimiento") or {}).get("contexto") or {}
@@ -2092,6 +2217,128 @@ class DirectReconciliationDetailView(APIView):
                 raise ValidationError({"detail": "No se pudo guardar el vínculo; el cambio en la cuenta se revirtió."}) from exc
             return Response(_job_response(job_dir, job))
 
+        if action == "confirmar_revision":
+            metadata = job_dir / "metadata.json"
+            original_job = None
+            written = False
+            try:
+                with transaction.atomic(), connection.cursor() as cursor:
+                    cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", [str(job_id)])
+                    job = _read_json(metadata)
+                    if not job.get("cuenta_id") or str(request.data.get("cuenta_id")) != str(job["cuenta_id"]):
+                        raise ValidationError({"cuenta_id": "El trabajo no pertenece a la cuenta solicitada."})
+                    result = job.get("resultado") or {}
+                    diagnostics = result.get("diagnosticos") or []
+                    index = request.data.get("indice")
+                    if type(index) is not int or not 0 <= index < len(diagnostics):
+                        raise ValidationError({"observacion": "La observación ya no está disponible."})
+                    diagnostic = diagnostics[index]
+                    if diagnostic.get("codigo") != request.data.get("codigo") or diagnostic.get("codigo") not in (
+                        "exclusiones_requeridas", "errores_estado_bancario",
+                        "errores_mayor_contable", "cuenta_numero_incompatible",
+                    ):
+                        raise ValidationError({"observacion": "Esta observación requiere otro tipo de revisión."})
+                    if diagnostic.get("revision_confirmada"):
+                        return Response(_job_response(job_dir, job))
+                    original_job = json.loads(json.dumps(job, ensure_ascii=False))
+                    diagnostic["revision_confirmada"] = {
+                        "usuario_id": scope["user_id"],
+                        "usuario_nombre": scope.get("user_name"),
+                        "confirmado_en": now,
+                    }
+                    cursor.execute("SELECT set_config('contared.actor_id', %s, true)", [scope["user_id"]])
+                    cursor.execute(
+                        """
+                        UPDATE contared.trabajos_conciliacion_directa
+                        SET resultado=%s::jsonb, actualizado_en=NOW()
+                        WHERE id=%s AND empresa_id=%s AND pais_codigo=%s
+                        """,
+                        [json.dumps(result, ensure_ascii=False), job_id, scope["company_id"], scope["country_code"]],
+                    )
+                    _write_json(metadata, job)
+                    written = True
+            except DatabaseError as exc:
+                if written:
+                    _write_json(metadata, original_job)
+                raise DatabaseUnavailable() from exc
+            except OSError as exc:
+                raise ValidationError({"detail": "No se pudo guardar la confirmación de revisión."}) from exc
+            return Response(_job_response(job_dir, job))
+
+        if action == "resolver_cierre":
+            original_job = json.loads(json.dumps(job, ensure_ascii=False))
+            result = job.get("resultado") or {}
+            diagnostics = result.get("diagnosticos") or []
+            closure = result.get("resumen", {}).get("cierre_bancario") if isinstance(result.get("resumen"), dict) else None
+            pending = next(
+                (item for item in diagnostics
+                 if item.get("codigo") == "cobertura_bancaria_incierta"
+                 and not item.get("resuelto")),
+                None,
+            )
+            if pending is None and isinstance(closure, dict) and closure.get("estado") == "resuelto":
+                return Response(_job_response(job_dir, job))
+            if pending is None:
+                raise ValidationError({"cierre": "El análisis no tiene pendiente el aviso de cierre bancario."})
+            method = str(request.data.get("tipo") or "").strip()
+            if method not in ("confirmar", "manual"):
+                raise ValidationError({"tipo": "Selecciona Confirmar saldo o Ingresar saldo manual."})
+            summary = result.get("resumen") or {}
+            detected = _parse_decimal(summary.get("saldo_final_banco_detectado", summary.get("saldo_final_banco")))
+            if method == "confirmar":
+                confirmed = detected
+                reason = "El usuario verificó el último Saldo Real como saldo de cierre del período."
+            else:
+                confirmed = _parse_decimal(request.data.get("saldo_confirmado"))
+                reason = str(request.data.get("motivo") or "").strip()
+                if not reason:
+                    raise ValidationError({"motivo": "El motivo es obligatorio para ingresar un saldo manual."})
+                if len(reason) > 1000:
+                    raise ValidationError({"motivo": "El motivo no puede superar 1,000 caracteres."})
+                account_currency = str(job.get("moneda_codigo") or (job.get("cuenta_seleccionada") or {}).get("moneda_codigo") or "").upper()
+                request_currency = str(request.data.get("moneda") or account_currency).upper()
+                if account_currency and request_currency != account_currency:
+                    raise ValidationError({"moneda": "El saldo debe ingresarse en la moneda de la cuenta."})
+            resolution = _apply_closure_resolution(
+                result,
+                method=method,
+                confirmed_balance=confirmed,
+                reason=reason,
+                scope=scope,
+                resolved_at=now,
+            )
+            job["resultado"] = result
+            job["actualizado_en"] = now
+            if job.get("estado") == "requiere_aclaraciones":
+                remaining = [item for item in result.get("diagnosticos", []) if not item.get("resuelto")]
+                if not remaining:
+                    job["estado"] = "preparado"
+            try:
+                with transaction.atomic():
+                    with connection.cursor() as cursor:
+                        cursor.execute("SELECT set_config('contared.actor_id', %s, true)", [scope["user_id"]])
+                        cursor.execute(
+                            """
+                            UPDATE contared.trabajos_conciliacion_directa
+                            SET estado=%s, resultado=%s::jsonb, diferenciado_residual=%s,
+                                actualizado_en=NOW()
+                            WHERE id=%s AND empresa_id=%s AND pais_codigo=%s
+                            """,
+                            [
+                                job.get("estado"), json.dumps(result, ensure_ascii=False),
+                                str(result.get("resumen", {}).get("diferencia_residual_pendiente") or ""),
+                                job_id, scope["company_id"], scope["country_code"],
+                            ],
+                        )
+                    _write_json(job_dir / "metadata.json", job)
+            except DatabaseError as exc:
+                _write_json(job_dir / "metadata.json", original_job)
+                raise DatabaseUnavailable() from exc
+            except OSError as exc:
+                _write_json(job_dir / "metadata.json", original_job)
+                raise ValidationError({"detail": "No se pudo guardar la resolución del cierre."}) from exc
+            return Response(_job_response(job_dir, job))
+
         if action == "finalizar":
             original_job = json.loads(json.dumps(job, ensure_ascii=False))
             account, suggestion = _validate_job_account(
@@ -2200,21 +2447,42 @@ class DirectReconciliationDetailView(APIView):
                 requested_period = None
             replacement = request.FILES.getlist("files")
             source_files = replacement
+            replacement_name = str(request.data.get("reemplazar_archivo") or "").strip()
             if not source_files:
                 original_files = list((job_dir / "originales").glob("*"))
                 if not original_files:
                     raise ValidationError({"files": "No hay archivos originales recuperables para recalcular."})
+            elif replacement_name:
+                original_files = list((job_dir / "originales").glob("*"))
+                if not any(item.name == replacement_name for item in original_files):
+                    raise ValidationError({"reemplazar_archivo": "El archivo que se desea reemplazar no pertenece a este análisis."})
+                if len(source_files) != 1:
+                    raise ValidationError({"files": "El reemplazo debe contener un solo archivo."})
             new_id = str(uuid4())
             new_dir = _job_path(scope, new_id)
             originals = new_dir / "originales"
             originals.mkdir(parents=True)
             uploaded = []
             try:
-                if source_files:
+                if source_files and replacement_name:
+                    uploaded_file = source_files[0]
+                    if not uploaded_file.name.lower().endswith((".xlsx", ".xls")):
+                        raise ValidationError({"files": "Todos los documentos deben ser .xlsx o .xls."})
+                    replacement_content = uploaded_file.read()
+                    replacement_path = originals / Path(uploaded_file.name).name
+                    replacement_path.write_bytes(replacement_content)
+                    uploaded.append({"nombre": replacement_path.name, "tamano_bytes": len(replacement_content), "sha256": hashlib.sha256(replacement_content).hexdigest(), "estado": "recibido"})
+                    selected = [
+                        uploaded_file if item.name == replacement_name else item
+                        for item in original_files
+                    ]
+                elif source_files:
                     selected = source_files
                 else:
                     selected = original_files
                 for uploaded_file in selected:
+                    if replacement_name and uploaded_file is source_files[0]:
+                        continue
                     if hasattr(uploaded_file, "read"):
                         if not uploaded_file.name.lower().endswith((".xlsx", ".xls")):
                             raise ValidationError({"files": "Todos los documentos deben ser .xlsx o .xls."})
@@ -2392,6 +2660,26 @@ class DirectReconciliationReportView(APIView):
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
         ]))
         story.extend([context_table, Spacer(1, 12)])
+        closure = summary.get("cierre_bancario") if isinstance(summary.get("cierre_bancario"), dict) else None
+        if closure and closure.get("estado") == "resuelto":
+            source = closure.get("origen") or {}
+            closure_table = Table([
+                ["Cierre bancario", "Saldo"],
+                ["Saldo Real detectado", money(closure.get("saldo_detectado"))],
+                ["Saldo confirmado", money(closure.get("saldo_confirmado"))],
+                ["Revisión", f"{closure.get('usuario_nombre') or 'Usuario'} · {closure.get('resuelto_en') or 'Fecha no disponible'}"],
+                ["Origen", " · ".join(str(source.get(key)) for key in ("archivo", "hoja", "fila", "fecha") if source.get(key)) or "No disponible"],
+                ["Motivo", closure.get("motivo") or "Saldo Real verificado"],
+            ], colWidths=[1.55 * inch, 5.25 * inch])
+            closure_table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#ECFDF3")),
+                ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#166534")),
+                ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#E5E7EB")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ]))
+            story.extend([closure_table, Spacer(1, 12)])
 
         explanation = summary.get("explicacion_diferencia", {})
         applied_items = explanation.get("residual", {}).get("partidas_aplicadas", [])
@@ -2702,6 +2990,8 @@ class DirectReconciliationReportView(APIView):
         summary_headers = ["Concepto", "Valor"]
         summary_rows = [
             ["Saldo final Banco", _parse_decimal(summary.get("saldo_final_banco"))],
+            [(summary.get("saldo_final_banco_fuente") or {}).get("columna", "Saldo bancario detectado"), _parse_decimal(summary.get("saldo_final_banco_detectado"))],
+            ["Saldo confirmado de cierre", _parse_decimal((summary.get("cierre_bancario") or {}).get("saldo_confirmado"))],
             ["Saldo final Contabilidad", _parse_decimal(summary.get("saldo_final_contabilidad"))],
             ["Diferencia original", _parse_decimal(summary.get("diferencia_original"))],
             ["Diferencia residual pendiente", _parse_decimal(summary.get("diferencia_residual_pendiente"))],
@@ -2715,7 +3005,22 @@ class DirectReconciliationReportView(APIView):
         prepare_sheet(summary_sheet, "Resumen de conciliación", context_rows, summary_headers, [34, 22], summary_rows)
         summary_table_start = 11
         for row_number in range(summary_table_start, summary_table_start + len(summary_rows)):
-            summary_sheet.cell(row_number, 2).number_format = amount_format if row_number <= summary_table_start + 3 else '0'
+            summary_sheet.cell(row_number, 2).number_format = amount_format if row_number <= summary_table_start + 5 else '0'
+        closure = summary.get("cierre_bancario") if isinstance(summary.get("cierre_bancario"), dict) else None
+        if closure and closure.get("estado") == "resuelto":
+            closure_start = summary_sheet.max_row + 2
+            summary_sheet.cell(closure_start, 1, "Revisión de cierre bancario").font = Font(bold=True, color=navy, size=12)
+            closure_rows = [
+                ["Estado", "Saldo verificado"],
+                ["Tipo", closure.get("tipo")],
+                ["Usuario", closure.get("usuario_nombre")],
+                ["Fecha", closure.get("resuelto_en")],
+                ["Origen", " · ".join(str((closure.get("origen") or {}).get(key)) for key in ("archivo", "hoja", "fila", "fecha") if (closure.get("origen") or {}).get(key))],
+                ["Motivo", closure.get("motivo") or "Saldo Real verificado"],
+            ]
+            for offset, values in enumerate(closure_rows, start=closure_start + 1):
+                summary_sheet.cell(offset, 1, values[0])
+                summary_sheet.cell(offset, 2, values[1])
         partidas = summary.get("partidas_conciliatorias", [])
         if partidas:
             start = summary_sheet.max_row + 2
@@ -3025,5 +3330,58 @@ class DirectReconciliationSourceView(APIView):
         source = job_dir / "originales" / safe_name
         if not source.is_file():
             raise NotFound("El archivo original ya no está disponible.")
+        if "fila" in request.query_params:
+            if not requested_account_id:
+                raise ValidationError({"cuenta_id": "Indica la cuenta del trabajo."})
+            try:
+                row = int(request.query_params.get("fila", ""))
+            except ValueError as exc:
+                raise ValidationError({"fila": "Indica un número de fila válido."}) from exc
+            if not 1 <= row <= MAX_DATA_ROWS + 100:
+                raise ValidationError({"fila": "Indica un número de fila válido."})
+            sheet = request.query_params.get("hoja", "")
+            return Response(self._source_row(job_dir, job, source, sheet, row))
         content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if source.suffix.lower() == ".xlsx" else "application/vnd.ms-excel"
         return FileResponse(source.open("rb"), as_attachment=True, filename=safe_name, content_type=content_type)
+
+    @staticmethod
+    def _source_row(job_dir, job, source, sheet_name, row):
+        files = (job.get("resultado") or {}).get("archivos") or []
+        recognition = next((item.get("reconocimiento") or {} for item in files if item.get("nombre") == source.name), {})
+        synthetic_header = bool(recognition.get("encabezado_sintetico") and sheet_name == recognition.get("hoja"))
+        with TemporaryDirectory() as temporary:
+            path = source
+            if source.suffix.lower() == ".xls":
+                path = job_dir / "normalizados" / f"{source.stem}.xlsx"
+                if not path.is_file():
+                    path = Path(temporary) / "origen.xlsx"
+                    synthetic_header = _normalize_xls(source, path) and sheet_name == recognition.get("hoja")
+            try:
+                workbook = load_workbook(path, read_only=True, data_only=False)
+                try:
+                    if sheet_name not in workbook.sheetnames:
+                        raise NotFound("La hoja de origen no está disponible.")
+                    sheet = workbook[sheet_name]
+                    workbook_row = row + int(synthetic_header)
+                    if sheet.max_row is not None and workbook_row > sheet.max_row:
+                        raise NotFound("La fila de origen no está disponible.")
+                    values = next(sheet.iter_rows(min_row=workbook_row, max_row=workbook_row, max_col=min(sheet.max_column or MAX_COLUMNS, MAX_COLUMNS), values_only=True), ())
+                    header_row = recognition.get("fila_encabezados") if sheet_name == recognition.get("hoja") else None
+                    headers = (
+                        next(sheet.iter_rows(min_row=header_row, max_row=header_row, max_col=len(values), values_only=True), ())
+                        if isinstance(header_row, int) and 1 <= header_row < workbook_row and values else ()
+                    )
+                finally:
+                    workbook.close()
+            except (BadZipFile, InvalidFileException, OSError, ParseError, ValueError) as exc:
+                raise ValidationError({"archivo": "No se pudo leer el contenido de la fila original."}) from exc
+        return {
+            "archivo": source.name,
+            "hoja": sheet_name,
+            "fila": row,
+            "celdas": [
+                {"columna": get_column_letter(index + 1), "encabezado": str(headers[index]) if index < len(headers) and headers[index] is not None else None,
+                 "valor": _json_default(value) if not isinstance(value, (str, int, float, bool)) else value}
+                for index, value in enumerate(values) if value is not None
+            ],
+        }

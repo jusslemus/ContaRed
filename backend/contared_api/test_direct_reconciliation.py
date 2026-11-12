@@ -16,6 +16,7 @@ from contared_api.authentication import SupabaseUser
 from contared_api.direct_reconciliation import (
     DirectReconciliationDetailView,
     DirectReconciliationListCreateView,
+    DirectReconciliationSourceView,
     _analyze_files,
     _dashboard_sections,
     _difference_explanation,
@@ -25,6 +26,86 @@ from contared_api.direct_reconciliation import (
     _validate_account_result,
 )
 from contared_api.banking import CUENTAS_GT_CONFIRMADAS, CUENTAS_SV_CONFIRMADAS
+
+
+class DirectSourceRowTests(SimpleTestCase):
+    def test_row_preview_preserves_original_values_and_uses_selected_sheet(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "estado.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "Movimientos"
+            sheet.append(["Fecha", "Cuenta", "Importe"])
+            sheet.append(["Texto sin fecha", "09900003566", "=5+7"])
+            workbook.save(source)
+            workbook.close()
+            job = {"resultado": {"archivos": [{"nombre": source.name, "reconocimiento": {
+                "hoja": sheet.title, "fila_encabezados": 1,
+            }}]}}
+
+            row = DirectReconciliationSourceView._source_row(root, job, source, "Movimientos", 2)
+
+            self.assertEqual(row["fila"], 2)
+            self.assertEqual(row["hoja"], "Movimientos")
+            self.assertEqual(row["celdas"], [
+                {"columna": "A", "encabezado": "Fecha", "valor": "Texto sin fecha"},
+                {"columna": "B", "encabezado": "Cuenta", "valor": "09900003566"},
+                {"columna": "C", "encabezado": "Importe", "valor": "=5+7"},
+            ])
+
+
+class DirectObservationReviewTests(SimpleTestCase):
+    def test_review_persists_only_confirmation_and_is_idempotent(self):
+        job_id = uuid4()
+        user_id = uuid4()
+        account_id = str(uuid4())
+        summary = {"saldo_final_banco": "120.00", "saldo_final_contabilidad": "100.00",
+                   "diferencia_original": "20.00", "diferencia_residual_pendiente": "17.00"}
+        process = {"coincidencias_confirmadas": [{"monto_banco": "10.00"}]}
+        job = {
+            "id": str(job_id), "cuenta_id": account_id, "estado": "requiere_aclaraciones",
+            "progreso": [], "archivos": [], "creado_en": "", "actualizado_en": "",
+            "resultado": {
+                "resumen": summary, "proceso_conciliacion": process,
+                "diagnosticos": [
+                    {"codigo": "exclusiones_requeridas", "detalle": [{"fila": 6}]},
+                    {"codigo": "cuenta_numero_incompatible"},
+                ],
+            },
+        }
+        scope = {"user_id": str(user_id), "user_name": "Ana", "company_id": str(uuid4()), "country_code": "GT"}
+        factory = APIRequestFactory()
+        with tempfile.TemporaryDirectory() as directory:
+            metadata = Path(directory) / "metadata.json"
+            metadata.write_text(json.dumps(job), encoding="utf-8")
+            module = "contared_api.direct_reconciliation"
+            with (
+                patch(f"{module}._writer_access", return_value=scope),
+                patch(f"{module}._job_path", return_value=metadata.parent),
+                patch(f"{module}.transaction.atomic"),
+                patch(f"{module}.connection") as database,
+            ):
+                def confirm(code):
+                    request = factory.post("/", {
+                        "accion": "confirmar_revision", "cuenta_id": account_id, "indice": 0, "codigo": code,
+                    }, format="json")
+                    force_authenticate(request, user=SupabaseUser(user_id))
+                    return DirectReconciliationDetailView.as_view()(request, job_id=job_id)
+
+                self.assertEqual(confirm("cuenta_numero_incompatible").status_code, 400)
+                response = confirm("exclusiones_requeridas")
+                self.assertEqual(response.status_code, 200)
+                persisted = json.loads(metadata.read_text(encoding="utf-8"))
+                result = persisted["resultado"]
+                self.assertEqual(result["resumen"], summary)
+                self.assertEqual(result["proceso_conciliacion"], process)
+                self.assertEqual(result["diagnosticos"][1], job["resultado"]["diagnosticos"][1])
+                self.assertEqual(persisted["estado"], job["estado"])
+                self.assertEqual(result["diagnosticos"][0]["revision_confirmada"]["usuario_nombre"], "Ana")
+                self.assertEqual(confirm("exclusiones_requeridas").data["resultado"], result)
+                statements = database.cursor.return_value.__enter__.return_value.execute.call_args_list
+                self.assertEqual(sum("UPDATE contared." in call.args[0] for call in statements), 1)
 
 
 class DirectReconciliationCreateEndpointTests(SimpleTestCase):
