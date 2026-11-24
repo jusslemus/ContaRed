@@ -215,6 +215,8 @@ function classifyDetail(result: RowData, countryCode: Props["countryCode"]) {
   const checks: DetailCase[] = [];
   const classified = new Set<string>();
   const checkKeys = new Set<string>();
+  const integration = result.integracion_cheques as RowData[] | undefined;
+  const integratedIds = new Set((integration ?? []).map((item) => item.filas[0].id).filter(Boolean));
   const checkKey = (number: unknown, amount: unknown) => {
     const key = String(number ?? "").trim().replace(/^0+/, "");
     return key && amount != null && Number.isFinite(Number(amount)) ? `${key}:${Math.abs(Number(amount))}` : "";
@@ -226,6 +228,7 @@ function classifyDetail(result: RowData, countryCode: Props["countryCode"]) {
       const kind = collected ? "Cheque cobrado" : "Cheque en circulación";
       const key = checkKey(record.numero_documento, record.monto);
       if (key) checkKeys.add(key);
+      if (integration && !collected) continue;
       const historical = detailRow("Corte histórico", {
         movimiento: { ...record, referencia: record.numero_cero ? "Sin número" : record.numero_documento },
         evidencia: { archivo: record.archivo ?? cut.nombre, hoja: record.hoja, fila: record.fila },
@@ -239,6 +242,20 @@ function classifyDetail(result: RowData, countryCode: Props["countryCode"]) {
       checks.push(entry);
       cases.push(entry);
     }
+  }
+
+  for (const item of integration ?? []) {
+    const rows = item.filas.map((row: RowData) => detailRow(row.lado, row)) as DetailRow[];
+    const primary = item.filas[0];
+    if (primary.id) classified.add(primary.id);
+    const entry = {
+      kind: "Cheque en circulación",
+      status: item.numero ? "Pendiente de cobro" : "Pendiente de identificación",
+      note: item.motivo,
+      rows,
+    };
+    checks.push(entry);
+    cases.push(entry);
   }
 
   for (const match of process.coincidencias_confirmadas ?? []) {
@@ -255,6 +272,7 @@ function classifyDetail(result: RowData, countryCode: Props["countryCode"]) {
   }
 
   for (const group of difference.pendientes?.contabilidad?.reversiones_identificadas ?? []) {
+    if ((group.movimientos ?? []).some((item: RowData) => integratedIds.has(item.id))) continue;
     const rows = (group.movimientos ?? []).map((item: RowData) => {
       if (item.id) classified.add(item.id);
       return detailRow("Contabilidad", item);
@@ -263,6 +281,7 @@ function classifyDetail(result: RowData, countryCode: Props["countryCode"]) {
   }
 
   for (const candidate of difference.candidatos ?? []) {
+    if ((candidate.contabilidad ?? []).some((item: RowData) => integratedIds.has(item.id))) continue;
     const bank = (candidate.banco ?? []).map((item: RowData) => detailRow("Banco", item)) as DetailRow[];
     const books = (candidate.contabilidad ?? []).map((item: RowData) => detailRow("Contabilidad", item)) as DetailRow[];
     for (const item of [...(candidate.banco ?? []), ...(candidate.contabilidad ?? [])]) {
@@ -302,7 +321,7 @@ function classifyDetail(result: RowData, countryCode: Props["countryCode"]) {
       cases.push(entry);
       if (deposit) deposits.push(entry);
       const key = checkKey(movement.numero_cheque || movement.referencia, movement.monto);
-      if (check && !rejected && (!key || !checkKeys.has(key))) checks.push(entry);
+      if (check && !rejected && (!key || !checkKeys.has(key)) && (!integration || side === "banco")) checks.push(entry);
     }
   }
 
@@ -364,17 +383,20 @@ function ReconciliationDetail({ result, currency, countryCode, context, initialT
     if (String(item.lado).toLowerCase() === "contabilidad") adjustment.contabilidad -= Math.round(effect * 100);
   }
   const amounts = adjustments.reduce((total, item) => ({ banco: total.banco + item.banco, contabilidad: total.contabilidad + item.contabilidad }), { banco: 0, contabilidad: 0 });
-  const explained = applied.filter((item: RowData) => item.tipo !== "cheque_historico_cobrado");
+  const explained = applied;
+  const pendingChecks = checks.filter((entry) => entry.kind === "Cheque en circulación");
+  const formatAdjustment = (cents: number) =>
+    `${cents < 0 ? "(-)" : "(+)"} ${formatMoney(Math.abs(cents) / 100, currency)}`;
   const adjusted = (value: unknown, cents: number) => value == null || value === "" || !Number.isFinite(Number(value))
     ? null : (Math.round(Number(value) * 100) + cents) / 100;
   const selectedCases = tab === "depositos" ? deposits : checks;
   const reportGroups = tab === "depositos"
     ? ["Depósito mal operado", "Diferencia por centavos", "Depósito en circulación"]
-    : ["Cheque en circulación", "Cheque cobrado"];
-  const reportTotals = (entries: DetailCase[]) => {
-    const cents = entries.reduce((total, entry) => total + Math.round(Math.abs(entry.amount ?? Number(entry.rows[0]?.movement.monto)) * 100), 0);
-    return Number.isFinite(cents) ? formatMoney(cents / 100, currency) : "No disponible";
-  };
+    : ["Cheque en circulación"];
+  const reportTotalCents = (entries: DetailCase[]) =>
+    entries.reduce((total, entry) => total + Math.round(Math.abs(entry.amount ?? Number(entry.rows[0]?.movement.monto)) * 100), 0);
+  const formatReportTotal = (cents: number) => formatMoney(Number.isFinite(cents) ? cents / 100 : null, currency);
+  const listedCheckCents = reportTotalCents(pendingChecks);
 
   return <dialog ref={dialog} className="difference-modal" aria-labelledby="difference-modal-title" onCancel={(event) => { event.preventDefault(); onClose(); }}>
     <header>
@@ -404,25 +426,39 @@ function ReconciliationDetail({ result, currency, countryCode, context, initialT
         {onPrint && tab !== "movimientos" && <button type="button" className="secondary-button" onClick={onPrint}>Imprimir {detailTabs[tab].toLowerCase()}</button>}
       </div>
       {tab === "resumen" && <>
-        <p className="difference-note">El saldo del Banco es la referencia del cuadre. Los saldos ajustados solo incluyen partidas verificadas. Los candidatos se consultan en Movimientos, Depósitos y Cheques.</p>
         <div className="difference-table-scroll"><table className="difference-table">
           <thead><tr><th>Concepto</th><th className="money">Contabilidad</th><th className="money">Banco</th></tr></thead>
           <tbody>
             <tr><th scope="row">Saldos finales</th><td className="money">{formatMoney(summary.saldo_final_contabilidad, currency)}</td><td className="money">{formatMoney(summary.saldo_final_banco, currency)}</td></tr>
-            <tr><th scope="row">{adjustments[0].label}</th><td className="money">{formatMoney(adjustments[0].contabilidad / 100, currency)}</td><td className="money">{formatMoney(adjustments[0].banco / 100, currency)}</td></tr>
+            <tr><th scope="row">{adjustments[0].label}</th><td className="money">{formatAdjustment(adjustments[0].contabilidad)}</td><td className="money">{formatAdjustment(adjustments[0].banco)}</td></tr>
             <tr><th scope="row">Subtotal</th><td className="money">{formatMoney(adjusted(summary.saldo_final_contabilidad, adjustments[0].contabilidad), currency)}</td><td className="money">{formatMoney(adjusted(summary.saldo_final_banco, adjustments[0].banco), currency)}</td></tr>
-            {adjustments.slice(1).map((item) => <tr key={item.label}><th scope="row">{item.label}</th><td className="money">{formatMoney(item.contabilidad / 100, currency)}</td><td className="money">{formatMoney(item.banco / 100, currency)}</td></tr>)}
+            {adjustments.slice(1).map((item) => {
+              const isCheckRow = item === adjustments[1] && pendingChecks.length > 0;
+              const showListedTotal = isCheckRow && listedCheckCents !== item.contabilidad;
+              return <tr key={item.label}>
+                <th scope="row">{item.label}{isCheckRow && <div>
+                  <button type="button" className="detail-button" onClick={() => setTab("cheques")}>Ver integración de cheques ({pendingChecks.length})</button>
+                </div>}</th>
+                <td className="money">{showListedTotal ? <>
+                  <div>Total listado <strong>{formatReportTotal(listedCheckCents)}</strong></div>
+                  <div>Aplicado {formatAdjustment(item.contabilidad)}</div>
+                </> : formatAdjustment(item.contabilidad)}</td>
+                <td className="money">{formatAdjustment(item.banco)}</td>
+              </tr>;
+            })}
             <tr><th scope="row">Saldos ajustados</th><td className="money">{formatMoney(adjusted(summary.saldo_final_contabilidad, amounts.contabilidad), currency)}</td><td className="money">{formatMoney(adjusted(summary.saldo_final_banco, amounts.banco), currency)}</td></tr>
-            <tr><th scope="row" colSpan={2}>Diferencia pendiente</th><td className="money"><strong>{formatMoney(summary.diferencia_residual_pendiente, currency)}</strong></td></tr>
+            <tr><th scope="row" colSpan={2}>Diferencia original entre Banco y Contabilidad</th><td className="money"><strong>{formatMoney(summary.diferencia_original, currency)}</strong></td></tr>
           </tbody>
         </table></div>
-        <p>{deposits.length} casos en Depósitos · {checks.filter((entry) => entry.kind === "Cheque en circulación").length} casos de cheques pendientes o por verificar</p>
-        {applied.some((item: RowData) => item.tipo === "cheque_historico_cobrado") && <p>Consulta los cobros usados en el cuadre en <button type="button" className="detail-button" onClick={() => setTab("cheques")}>Cheques</button>.</p>}
+        <p>{deposits.length} casos en Depósitos{pendingChecks.length > 0 && <>
+          {" · "}<button type="button" className="detail-button" onClick={() => setTab("cheques")}>Ver cheques en circulación ({pendingChecks.length})</button>
+          {pendingChecks.some((entry) => entry.status === "Pendiente de identificación") && " · Incluye registros sin número de cheque"}
+        </>}</p>
         {explained.length > 0 && <div className="difference-table-scroll"><table className="difference-table">
           <thead><tr><th>Concepto</th><th>Lado</th><th className="money">Importe</th><th>Origen</th></tr></thead>
           <tbody>{explained.map((item: RowData, index: number) => <tr key={index}>
             <td>{item.concepto}</td><td>{item.lado}</td><td className="money">{formatMoney(item.importe_con_signo, currency)}</td>
-            <td>{item.evidencia?.banco && <Evidence evidence={item.evidencia.banco} onOpenSource={onOpenSource} label="Evidencia bancaria" />}{item.evidencia?.historico && <Evidence evidence={item.evidencia.historico} onOpenSource={onOpenSource} label="Corte histórico" />}</td>
+            <td>{item.evidencia?.banco && <Evidence evidence={item.evidencia.banco} onOpenSource={onOpenSource} label="Evidencia bancaria" />}{item.evidencia?.contabilidad && <Evidence evidence={item.evidencia.contabilidad} onOpenSource={onOpenSource} label="Mayor contable" />}{item.evidencia?.historico && <Evidence evidence={item.evidencia.historico} onOpenSource={onOpenSource} label="Corte histórico" />}</td>
           </tr>)}</tbody>
         </table></div>}
         {applied.length === 0 && <p className="empty-copy">No hay partidas verificadas aplicadas.</p>}
@@ -438,10 +474,12 @@ function ReconciliationDetail({ result, currency, countryCode, context, initialT
         </details>;
       }) : <p className="empty-copy">No hay movimientos evaluables en los documentos reconocidos.</p>)}
       {(tab === "depositos" || tab === "cheques") && <>
-        {tab === "cheques" && <p className="difference-note">Los cobros se muestran para el cuadre. Los cheques pendientes incluyen el corte histórico reconocido y los candidatos de este período.</p>}
+        {tab === "cheques" && <p className="difference-note">{result.integracion_cheques
+          ? "El listado integra los cheques pendientes del mes y del corte anterior. Cada partida incluye su origen. Consultá los cobros en Movimientos."
+          : "Los cheques pendientes incluyen el corte histórico reconocido y los candidatos de este período. Consultá los cheques cobrados en Movimientos."}</p>}
         {reportGroups.map((kind) => {
           const entries = selectedCases.filter((entry) => entry.kind === kind);
-          return <section key={kind} className="detail-report-group"><h4>{kind} ({entries.length}){entries.length > 0 && ` · Total listado ${reportTotals(entries)}`}</h4>
+          return <section key={kind} className="detail-report-group"><h4>{kind} ({entries.length}){entries.length > 0 && ` · Total listado ${formatReportTotal(reportTotalCents(entries))}`}</h4>
             {entries.length ? <DetailCaseList entries={entries} currency={currency} onOpenSource={onOpenSource} /> : <p className="empty-copy">Sin casos identificados.</p>}
           </section>;
         })}

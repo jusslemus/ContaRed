@@ -290,7 +290,7 @@ class DirectReconciliationCreateEndpointTests(SimpleTestCase):
         cursor.fetchone.return_value = self.account_row
         cursor.fetchall.return_value = [self.account_row]
         mock_connection.cursor.return_value.__enter__.return_value = cursor
-        source = Path(__file__).resolve().parents[2] / "docs contared" / "GT" / "octubre"
+        source = Path(__file__).resolve().parents[2] / "docs contared" / "GT" / "INDUSTRIAL" / "octubre"
         def analyze(paths):
             uploads = [
                 SimpleUploadedFile(path.name, path.read_bytes(), content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -314,9 +314,9 @@ class DirectReconciliationCreateEndpointTests(SimpleTestCase):
         self.assertEqual(len(response.data["resultado"]["cheques"][0]["registros"]), 6)
         self.assertEqual(
             response.data["resultado"]["resumen"]["diferencia_residual_pendiente"],
-            "8166.39",
+            "0.00",
         )
-        old_cheques = Path(__file__).resolve().parents[2] / "docs contared" / "GT" / "septiembre" / "Cheques en circulación.xlsx"
+        old_cheques = Path(__file__).resolve().parents[2] / "docs contared" / "GT" / "INDUSTRIAL" / "Cheques en circulación.xlsx"
         previous_format_response = analyze([
             *[path for path in source.glob("*.xlsx") if "cheque" not in path.name.casefold()],
             old_cheques,
@@ -492,7 +492,7 @@ class DirectGuatemalaReconciliationTests(SimpleTestCase):
         self.job = self.root / "job"
         originals = self.job / "originales"
         originals.mkdir(parents=True)
-        source = Path(__file__).resolve().parents[2] / "docs contared" / "GT" / "septiembre"
+        source = Path(__file__).resolve().parents[2] / "docs contared" / "GT" / "INDUSTRIAL"
         names = [
             next(source.glob("Estado de cuenta Banco Septiembre.xlsx")).name,
             next(source.glob("Saldo de cuenta - 1101030103*.xlsx")).name,
@@ -554,9 +554,9 @@ class DirectGuatemalaReconciliationTests(SimpleTestCase):
             for item in result["depositos"]["salidas_pendientes"]
         ))
 
-    def test_october_biq_imports_september_cheques_and_applies_unique_cq_charges_once(self):
+    def test_october_biq_lists_historical_cheques_without_applying_cleared_checks(self):
         self._clear_originals()
-        source = Path(__file__).resolve().parents[2] / "docs contared" / "GT" / "octubre"
+        source = Path(__file__).resolve().parents[2] / "docs contared" / "GT" / "INDUSTRIAL" / "octubre"
         for path in source.glob("*.xlsx"):
             shutil.copy2(path, self.job / "originales" / path.name)
         self.assertEqual(len(list((self.job / "originales").iterdir())), 3)
@@ -586,12 +586,36 @@ class DirectGuatemalaReconciliationTests(SimpleTestCase):
         self.assertEqual(by_number["0"]["estado_al_corte"], "pendiente_identificacion")
         self.assertEqual(sum(record["numero_cero"] for record in cut["registros"]), 2)
 
+        # A saved October result from the previous calculation only applied cleared cheques.
+        del result["integracion_cheques"]
+        summary = result["resumen"]
+        summary["partidas_conciliatorias"] = [
+            item for item in summary["partidas_conciliatorias"] if item["tipo"] == "cheque_historico_cobrado"
+        ]
+        summary["explicacion_diferencia"]["residual"]["partidas_aplicadas"] = summary["partidas_conciliatorias"]
+        summary["diferencia_residual_pendiente"] = "8166.39"
+        job = {
+            "id": str(uuid4()), "estado": "preparado", "progreso": [], "pais_codigo": "GT",
+            "archivos": [], "creado_en": "", "actualizado_en": "", "resultado": result,
+        }
+        result = _job_response(self.job, job)["resultado"]
         explanation = result["resumen"]["explicacion_diferencia"]
         applied = explanation["residual"]["partidas_aplicadas"]
-        self.assertEqual(len(applied), 4)
-        self.assertTrue(all(item["afecta_residual"] for item in applied))
-        self.assertEqual(result["resumen"]["diferencia_residual_pendiente"], "8166.39")
-        identified_ids = [item["id"] for item in applied]
+        self.assertEqual(len(applied), 8)
+        self.assertEqual({item["tipo"] for item in applied}, {"cheque_en_circulacion"})
+        self.assertEqual({item["lado"] for item in applied}, {"Contabilidad"})
+        self.assertEqual(sum(Decimal(item["importe_con_signo"]) for item in applied), Decimal("19198.97"))
+        integration = result["integracion_cheques"]
+        self.assertEqual({item["numero"] for item in integration}, {None, "13741", "13742", "13748", "13750", "13753"})
+        self.assertEqual(len([item for item in integration if item["numero"] is None]), 3)
+        reissued = next(item for item in integration if item["referencia"] == "8072")
+        self.assertEqual([row["evidencia"]["fila"] for row in reissued["filas"]], [99, 4, 71])
+        identified = [item for item in explanation["partidas_explicativas"] if item["tipo"] == "cheque_historico_cobrado"]
+        self.assertEqual(len(identified), 4)
+        self.assertTrue(all(item["verificada"] and not item["afecta_residual"] for item in identified))
+        self.assertEqual(Decimal(result["resumen"]["diferencia_original"]), Decimal("19198.97"))
+        self.assertEqual(result["resumen"]["diferencia_residual_pendiente"], "0.00")
+        identified_ids = [item["id"] for item in identified]
         self.assertEqual(len(identified_ids), len(set(identified_ids)))
         self.assertFalse({
             item["id"] for item in explanation["pendientes"]["banco"]["movimientos"]
@@ -599,12 +623,12 @@ class DirectGuatemalaReconciliationTests(SimpleTestCase):
 
     def test_october_analysis_keeps_the_previous_cheque_header_format(self):
         self._clear_originals()
-        source = Path(__file__).resolve().parents[2] / "docs contared" / "GT"
+        source = Path(__file__).resolve().parents[2] / "docs contared" / "GT" / "INDUSTRIAL"
         october = source / "octubre"
         for path in october.glob("*.xlsx"):
             if "cheque" not in path.name.casefold():
                 shutil.copy2(path, self.job / "originales" / path.name)
-        old_format = source / "septiembre" / "Cheques en circulación.xlsx"
+        old_format = source / "Cheques en circulación.xlsx"
         parsed_old_format = _historical_cheques(old_format)
         self.assertEqual(parsed_old_format["periodo_corte"], "2026-08")
         self.assertTrue(any(
@@ -625,7 +649,7 @@ class DirectGuatemalaReconciliationTests(SimpleTestCase):
 
     def test_failed_cheque_file_reports_filename_and_reason(self):
         self._clear_originals()
-        source = Path(__file__).resolve().parents[2] / "docs contared" / "GT" / "octubre"
+        source = Path(__file__).resolve().parents[2] / "docs contared" / "GT" / "INDUSTRIAL" / "octubre"
         for path in source.glob("*.xlsx"):
             if "cheque" not in path.name.casefold():
                 shutil.copy2(path, self.job / "originales" / path.name)
@@ -898,6 +922,20 @@ class DirectDifferenceExplanationTests(SimpleTestCase):
         self.assertEqual(result["resumen"]["diferencia_residual_pendiente"], "50.41")
         self.assertEqual(len(explanation["residual"]["partidas_aplicadas"]), 1)
         self.assertTrue(explanation["residual"]["partidas_aplicadas"][0]["afecta_residual"])
+
+    def test_saved_cleared_check_is_not_applied_to_difference(self):
+        result = self._result("19198.97")
+        result["resumen"]["partidas_conciliatorias"] = [{
+            "tipo": "cheque_historico_cobrado",
+            "diferencia_signo": "-3700.00",
+            "lado": "Banco",
+            "verificado": True,
+            "afecta_residual": True,
+        }]
+        _difference_explanation(result)
+        summary = result["resumen"]
+        self.assertEqual(summary["diferencia_residual_pendiente"], "19198.97")
+        self.assertEqual(summary["explicacion_diferencia"]["residual"]["partidas_aplicadas"], [])
 
     def test_explicit_cancellation_pairs_once_and_keeps_date_net(self):
         result = self._result("0.00")

@@ -284,7 +284,7 @@ export default function DirectReconciliationModule(props: Props) {
     setApiError("");
     const params = new URLSearchParams({ empresa_id: props.companyId, pais_codigo: props.countryCode });
     if (requestedAccountId) params.set("cuenta_id", requestedAccountId);
-    const response = await fetch(`${apiBaseUrl}/api/v1/conciliaciones-directas/trabajos/${jobId}/?${params}`, { headers: authHeaders });
+    const response = await fetch(`${apiBaseUrl}/api/v1/conciliaciones-directas/trabajos/${jobId}/?${params}`, { headers: authHeaders, cache: "no-store" });
     if (!response.ok) throw new Error(await responseError(response, `No se pudo recuperar el trabajo (HTTP ${response.status}).`));
     const job = await response.json() as { id: string; cuenta_id?: string; cuenta_seleccionada?: AccountOption; vinculacion_cuenta?: AccountLinkSuggestion | null; resultado?: Record<string, any>; estado: string };
     setActiveJobId(job.id);

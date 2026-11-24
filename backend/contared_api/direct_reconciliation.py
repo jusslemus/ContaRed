@@ -1373,10 +1373,6 @@ def _analyze_files(job_dir, country_code, period=None):
     movements_bank = len(bank["movimientos"]) if bank else 0
     bank_rows = bank["filas_analizadas"] if bank else 0
     movements_ledger = len(ledger["movimientos"]) if ledger else 0
-    pending_bank_ids = {
-        item.get("movimiento_id")
-        for item in result.get("proceso_conciliacion", {}).get("movimientos_sin_contraparte", {}).get("banco", [])
-    }
     partidas = []
     for cut in result.get("cheques", []):
         for record in cut.get("registros", []):
@@ -1384,11 +1380,6 @@ def _analyze_files(job_dir, country_code, period=None):
             if len(cobros) == 1:
                 cobro = cobros[0]
                 bank_amount = _parse_decimal(cobro.get("monto"))
-                affects_residual = (
-                    cobro.get("movimiento_id") in pending_bank_ids
-                    and bank_amount is not None
-                    and bank_amount < 0
-                )
                 partidas.append({
                     "id": cobro.get("movimiento_id"),
                     "movimiento_id": cobro.get("movimiento_id"),
@@ -1398,14 +1389,9 @@ def _analyze_files(job_dir, country_code, period=None):
                     "importe_con_signo": str(bank_amount) if bank_amount is not None else None,
                     "lado": "Banco",
                     "signo": "salida" if bank_amount is not None and bank_amount < 0 else "pendiente",
-                    "diferencia_signo": str(bank_amount) if affects_residual else "0.00",
-                    "afecta_residual": affects_residual,
-                    "movimiento_id": cobro.get("movimiento_id"),
-                    "motivo": (
-                        "Cargo bancario CQ identificado por referencia e importe exactos; sigue sin contraparte contable y se aplica una sola vez al residual."
-                        if affects_residual else
-                        "Cargo bancario CQ identificado, pero ya está consumido por otro cruce o no es un cargo pendiente; no se vuelve a aplicar al residual."
-                    ),
+                    "diferencia_signo": "0.00",
+                    "afecta_residual": False,
+                    "motivo": "Cargo bancario CQ identificado por referencia e importe exactos. Su importe ya figura en el saldo bancario.",
                     "evidencia_banco": cobro.get("evidencia"),
                     "evidencia_historico": {
                         "archivo": record.get("archivo"),
@@ -1509,6 +1495,179 @@ def _same_day_group_candidates(bank_pending, books_pending, excluded_ids):
     ]
 
 
+def _biq_cheques_en_circulacion(result):
+    bank = (result.get("banco") or {}).get("reconocimiento", {}).get("contexto", {})
+    books = (result.get("libros") or {}).get("reconocimiento", {}).get("contexto", {})
+    if (bank.get("pais_codigo"), bank.get("cuenta_bancaria"), books.get("codigo_contable")) != (
+        "GT", "0040040592", "1101030103",
+    ):
+        return None
+    period = bank.get("periodo_declarado") or books.get("periodo_declarado")
+    if not period or books.get("periodo_declarado") not in (None, period):
+        return None
+
+    def identifier(value):
+        value = str(value or "").strip()
+        return value.lstrip("0") if value.isascii() and value.isdecimal() else ""
+
+    def payment(movement):
+        source = movement.get("datos_originales") or {}
+        return (
+            identifier(source.get("Referencia 1")),
+            identifier(source.get("Referencia 2")),
+            str(source.get("Cuenta de contrapartida") or "").strip().upper(),
+        )
+
+    unmatched = result.get("proceso_conciliacion", {}).get("movimientos_sin_contraparte", {})
+    entries = {
+        item["movimiento_id"]: item
+        for item in unmatched.get("contabilidad", [])
+        if item["movimiento"].get("codigo_tt") == "PP"
+        and str(item["movimiento"].get("fecha") or "")[:7] == period
+    }
+    issues = {}
+    cancellations = {}
+    for movement_id, item in entries.items():
+        movement = item["movimiento"]
+        ref, number, payee = payment(movement)
+        amount = _parse_decimal(movement.get("monto"))
+        if not ref or not payee or not amount:
+            continue
+        if amount < 0 and not _has_explicit_cancellation(movement):
+            issues[movement_id] = (ref, number, payee, -amount)
+        elif amount > 0 and _has_explicit_cancellation(movement):
+            cancellations[movement_id] = (ref, number, payee, amount)
+
+    bank_numbers = {
+        identifier(movement.get("numero_cheque") or movement.get("referencia"))
+        for movement in result.get("movimientos_banco", [])
+        if movement.get("codigo_tt") == "CQ"
+    }
+    cuts = [cut for cut in result.get("cheques", []) if cut.get("periodo_corte") and cut["periodo_corte"] < period]
+    latest = max((cut["periodo_corte"] for cut in cuts), default=None)
+    historical = [
+        record for cut in cuts if cut["periodo_corte"] == latest
+        for record in cut.get("registros", [])
+    ]
+    used_bank_ids = {
+        cobro.get("movimiento_id") for record in historical for cobro in record.get("cobro_identificado", [])
+    }
+    unresolved_bank_amounts = {
+        _parse_decimal(item["movimiento"].get("monto"))
+        for item in unmatched.get("banco", [])
+        if item["movimiento"].get("codigo_tt") == "CQ" and item.get("movimiento_id") not in used_bank_ids
+    }
+    historical_numbers = {identifier(record.get("numero_documento")) for record in historical}
+    numbered_issues = {}
+    for ref, number, payee, amount in issues.values():
+        if number:
+            numbered_issues[number] = numbered_issues.get(number, 0) + 1
+
+    def book_row(movement_id, number=""):
+        item = entries[movement_id]
+        return {
+            "lado": "Contabilidad",
+            "id": movement_id,
+            "movimiento": {**item["movimiento"], "numero_cheque": number or None},
+            "evidencia": item.get("evidencia"),
+        }
+
+    def history_row(record, number):
+        return {
+            "lado": "Corte histórico",
+            "movimiento": {**record, "referencia": number or "Sin número"},
+            "evidencia": {key: record.get(key) for key in ("archivo", "hoja", "fila", "valor_original")},
+        }
+
+    integrated = []
+
+    def add(amount, number, rows, note):
+        evidence = rows[0].get("evidencia") or {}
+        movement = rows[0]["movimiento"]
+        integrated.append({
+            "id": rows[0].get("id") or f"cheque:{evidence.get('archivo')}:{evidence.get('hoja')}:{evidence.get('fila')}",
+            "numero": number or None,
+            "referencia": movement.get("referencia"),
+            "importe": str(amount),
+            "motivo": note,
+            "filas": rows,
+        })
+
+    def position(movement_id):
+        movement = entries[movement_id]["movimiento"]
+        return str(movement.get("fecha") or ""), int(movement.get("fila_origen") or 0)
+
+    # A payment with a cancellation may have been replaced under a new SAP
+    # reference. The reference of the cancelled cheque does not carry over.
+    for movement_id, (ref, number, payee, amount) in issues.items():
+        if number:
+            if number in bank_numbers or number in historical_numbers or numbered_issues[number] != 1:
+                continue
+            if any(cancel_ref == ref for cancel_ref, *_ in cancellations.values()):
+                continue
+            add(amount, number, [book_row(movement_id, number)], "Número de cheque en Referencia 2 del mayor, sin cobro identificado en Banco.")
+
+    historical_counts = {}
+    for record in historical:
+        number = identifier(record.get("numero_documento"))
+        match = re.search(r"\bPL[0-9]+\b", str(record.get("descripcion") or "").upper())
+        key = (number, match.group() if match and not number else "", _parse_decimal(record.get("monto")))
+        historical_counts.setdefault(key, []).append(record)
+
+    used_replacements = set()
+    for (number, payee, signed), records in historical_counts.items():
+        if len(records) != 1 or signed is None or signed >= 0:
+            continue
+        record = records[0]
+        if record.get("cobro_identificado") or (number and number in bank_numbers):
+            continue
+        if not number and (not payee or signed in unresolved_bank_amounts):
+            continue
+        matching_cancellations = [
+            cancel_id for cancel_id, (_, cancel_number, cancel_payee, amount) in cancellations.items()
+            if amount == -signed and (
+                (number and number == cancel_number) or (not number and payee == cancel_payee and not cancel_number)
+            )
+        ]
+        historical_row = history_row(record, number)
+        if matching_cancellations:
+            if len(matching_cancellations) != 1:
+                continue
+            cancel_id = matching_cancellations[0]
+            cancel_ref, _, cancel_payee, _ = cancellations[cancel_id]
+            replacements = [
+                movement_id for movement_id, (ref, current_number, current_payee, amount) in issues.items()
+                if ref != cancel_ref and not current_number and current_payee == cancel_payee
+                and amount == -signed and position(movement_id) > position(cancel_id)
+            ]
+            if len(replacements) == 1 and replacements[0] not in used_replacements:
+                replacement = replacements[0]
+                used_replacements.add(replacement)
+                add(-signed, "", [book_row(replacement), historical_row, book_row(cancel_id)],
+                    "Pago registrado nuevamente después de cancelar el anterior. Se cuenta una vez y queda pendiente el número de cheque.")
+        else:
+            add(-signed, number, [historical_row], "Pendiente según el corte anterior, sin cobro identificado en Banco.")
+
+    for cancel_id, (cancel_ref, cancel_number, payee, amount) in cancellations.items():
+        if not cancel_number or -amount in unresolved_bank_amounts:
+            continue
+        cancelled = [
+            movement_id for movement_id, info in issues.items()
+            if info == (cancel_ref, cancel_number, payee, amount) and position(movement_id) < position(cancel_id)
+        ]
+        replacements = [
+            movement_id for movement_id, (ref, number, current_payee, current_amount) in issues.items()
+            if ref != cancel_ref and not number and current_payee == payee and current_amount == amount
+            and position(movement_id)[0] == position(cancel_id)[0] and position(movement_id) > position(cancel_id)
+        ]
+        if len(cancelled) == 1 and len(replacements) == 1 and replacements[0] not in used_replacements:
+            replacement = replacements[0]
+            used_replacements.add(replacement)
+            add(amount, "", [book_row(replacement), book_row(cancelled[0], cancel_number), book_row(cancel_id)],
+                "Pago registrado nuevamente el día de la anulación. Se cuenta el pago nuevo, cuyo número de cheque queda pendiente.")
+    return integrated
+
+
 def _difference_explanation(result):
     summary = result.get("resumen", {})
     proceso = result.get("proceso_conciliacion", {})
@@ -1516,9 +1675,28 @@ def _difference_explanation(result):
     explanatory = []
     applied = []
     applied_effect = Decimal("0.00")
+    integration = _biq_cheques_en_circulacion(result)
+    if integration is not None:
+        result["integracion_cheques"] = integration
+        summary["partidas_conciliatorias"] = [
+            item for item in summary.get("partidas_conciliatorias", []) if not item.get("integracion_biq")
+        ] + [{
+            "id": item["id"],
+            "tipo": "cheque_en_circulacion",
+            "concepto": f"Cheque en circulación · {item['numero'] or item['referencia'] or 'Sin número'}",
+            "importe_con_signo": item["importe"],
+            "lado": "Contabilidad",
+            "diferencia_signo": str(-Decimal(item["importe"])),
+            "motivo": item["motivo"],
+            "evidencia_contabilidad": item["filas"][0]["evidencia"] if item["filas"][0]["lado"] == "Contabilidad" else None,
+            "evidencia_historico": next((row["evidencia"] for row in item["filas"] if row["lado"] == "Corte histórico"), None),
+            "verificado": True,
+            "afecta_residual": True,
+            "integracion_biq": True,
+        } for item in integration]
     for partida in summary.get("partidas_conciliatorias", []):
         amount = _parse_decimal(partida.get("importe_con_signo", partida.get("importe")))
-        affects = bool(partida.get("afecta_residual"))
+        affects = bool(partida.get("afecta_residual")) and partida.get("tipo") != "cheque_historico_cobrado"
         effect = _parse_decimal(partida.get("diferencia_signo")) if affects else Decimal("0.00")
         if effect is None:
             effect = Decimal("0.00")
@@ -1531,6 +1709,7 @@ def _difference_explanation(result):
             "motivo": partida.get("motivo") or "No hay evidencia registrada.",
             "evidencia": {
                 "banco": partida.get("evidencia_banco"),
+                "contabilidad": partida.get("evidencia_contabilidad"),
                 "historico": partida.get("evidencia_historico"),
             },
             "verificada": bool(partida.get("verificado")),
@@ -1915,7 +2094,14 @@ def _validate_job_account(scope, job, requested_account_id=None, validate_result
 
 
 def _job_response(job_dir, job):
-    result_context = job.get("resultado", {}).get("contexto_resultado", {})
+    result = job.get("resultado") or {}
+    summary = result.get("resumen") or {}
+    applied = (summary.get("explicacion_diferencia") or {}).get("residual", {}).get("partidas_aplicadas", [])
+    if any(item.get("tipo") == "cheque_historico_cobrado" for item in applied):
+        # Older results included cleared cheques in the balance adjustment.
+        # Rebuild the displayed breakdown from the saved movement evidence.
+        _difference_explanation(result)
+    result_context = result.get("contexto_resultado", {})
     if not isinstance(result_context, dict):
         result_context = {}
     normalized_context = dict(result_context)
@@ -1953,8 +2139,8 @@ def _job_response(job_dir, job):
         "responsable_nombre": job.get("responsable_nombre"),
         "es_borrador": job["estado"] in ("analizando", "recibiendo", "fallido", "preparado", "requiere_aclaraciones"),
         "archivos": job["archivos"],
-        "resultado": job.get("resultado", {}),
-        "diagnosticos": job.get("resultado", {}).get("diagnosticos", []),
+        "resultado": result,
+        "diagnosticos": result.get("diagnosticos", []),
         "creado_en": job["creado_en"],
         "actualizado_en": job["actualizado_en"],
     }
@@ -2572,6 +2758,8 @@ class DirectReconciliationReportView(APIView):
         if requested_account_id and requested_account_id != job.get("cuenta_id"):
             raise ValidationError({"cuenta_id": "El informe no pertenece a la cuenta solicitada."})
         result = job.get("resultado", {})
+        if result.get("resumen") and result.get("proceso_conciliacion"):
+            _difference_explanation(result)
         report_format = request.query_params.get("formato", "xlsx")
         if report_format == "xlsx":
             output = self._xlsx(scope, job, result)
@@ -2729,7 +2917,12 @@ class DirectReconciliationReportView(APIView):
         deposits = {"banco": Decimal("0.00"), "contabilidad": Decimal("0.00")}
         checks = deposits.copy()
         others = deposits.copy()
-        groups = {"deposito_transito": deposits, "cheque_historico_cobrado": checks}
+        groups = {
+            "deposito_transito": deposits,
+            "deposito_en_circulacion": deposits,
+            "cheque_en_circulacion": checks,
+            "cheque_circulacion": checks,
+        }
         effects_available = True
         has_other_items = False
         for item in applied_items:
@@ -2762,7 +2955,7 @@ class DirectReconciliationReportView(APIView):
                 )],
                 ["Subtotal", money(book_subtotal), money(bank_subtotal), Paragraph("Saldos después de los depósitos aplicados.", small)],
                 ["Cheques en circulación", money(checks["contabilidad"]), money(checks["banco"]), Paragraph(
-                    "Cobros de cheques de períodos anteriores." if any(checks.values()) else "Sin partidas de cheques aplicadas.", small,
+                    "Cheques pendientes de cobro verificados." if any(checks.values()) else "Sin partidas de cheques aplicadas.", small,
                 )],
             ])
             if has_other_items:
@@ -3159,7 +3352,24 @@ class DirectReconciliationReportView(APIView):
 
         cheque_headers = ["Corte histórico", "Situación al corte", "Fecha", "Número de cheque", "Descripción/Beneficiario", "Monto", "Archivo histórico", "Hoja", "Fila", "Cobro identificado", "Evidencia cobro"]
         cheque_rows = []
-        for cut in result.get("cheques", []):
+        integration = result.get("integracion_cheques")
+        if integration is not None:
+            cheque_headers = ["Origen", "Situación al corte", "Fecha", "Número de cheque", "Descripción / beneficiario", "Importe aplicado", "Archivo", "Hoja", "Fila", "Referencia", "Evidencia adicional"]
+            for item in integration:
+                primary, *other_rows = item["filas"]
+                movement = primary["movimiento"]
+                evidence = primary.get("evidencia") or {}
+                extra = [
+                    f"{row.get('archivo')} · {row.get('hoja')} · fila {row.get('fila')}"
+                    for entry in other_rows if (row := entry.get("evidencia"))
+                ]
+                cheque_rows.append([
+                    primary["lado"], "Pendiente de cobro" if item["numero"] else "Pendiente de identificación",
+                    excel_date(movement.get("fecha")), item["numero"], movement.get("descripcion"),
+                    Decimal(item["importe"]), evidence.get("archivo"), evidence.get("hoja"), evidence.get("fila"),
+                    item["referencia"], "\n".join(extra),
+                ])
+        for cut in result.get("cheques", []) if integration is None else []:
             for record in cut.get("registros", []):
                 cobro = record.get("cobro_identificado", [])
                 cobro_text = ""
