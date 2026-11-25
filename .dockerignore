@@ -1,0 +1,24 @@
+**/.git
+**/.git/**
+**/.env
+**/.env.*
+**/.venv
+**/venv
+**/node_modules
+**/dist
+**/__pycache__
+**/*.py[cod]
+**/*.log
+**/*.sqlite3
+**/*.zip
+**/*.xls
+**/*.xlsx
+**/*.xlsm
+**/*.csv
+**/private_storage
+**/test_artifacts
+**/storage
+docs contared
+coverage
+.pytest_cache
+.ruff_cache

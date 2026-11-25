@@ -237,3 +237,37 @@ Para desplegar la función, aplica manualmente `202610300004_eliminacion_definit
 
 - [Supabase: JSON Web Tokens](https://supabase.com/docs/guides/auth/jwts)
 - [Supabase: JWT Signing Keys](https://supabase.com/docs/guides/auth/signing-keys)
+
+
+## Despliegue Docker y Coolify
+
+El repositorio incluye Dockerfiles para Django/Gunicorn y React/Nginx. Nginx sirve el frontend y envía `/api/` al backend por la red interna. La base PostgreSQL y la autenticación continúan en Supabase; este despliegue no crea ni migra la base de datos.
+
+### Coolify desde GitHub
+
+1. Crear una aplicación desde este repositorio, rama `main`, con build pack **Docker Compose**.
+2. Usar directorio base `/` y archivo **`/docker-compose.coolify.yml`**. Este archivo es completo; no publica puertos fijos del servidor.
+3. Configurar en Coolify las variables de `.env.example` con los valores reales. No subir `.env` a Git. Los valores `VITE_*` se incorporan al compilar el frontend mediante `build.args`; deben estar disponibles durante el build. Una modificación requiere volver a desplegar.
+4. Asignar **`https://conta.red.com.sv`** al servicio **frontend**, puerto interno **80**. El backend usa el puerto interno 8000 y no necesita dominio público propio. Confirmar que el DNS del dominio apunta al servidor de Coolify y que no existe otro recurso atendiendo ese mismo dominio.
+5. Mantener el volumen persistente **`contared_private_storage`** montado en `/var/lib/contared/private_storage`. Contiene originales y metadatos del historial. No eliminarlo al actualizar. Respaldarlo junto con PostgreSQL. Los archivos locales de otra instalación no se transfieren automáticamente.
+6. Desplegar y comprobar `/api/v1/status/` (HTTP 200), inicio de sesión, cuentas, análisis, guardado, historial y descarga de reportes. Si se usan enlaces para establecer contraseña, autorizar la URL de redirección del dominio en Supabase Auth.
+
+El backend ejecuta dos workers y un thread por worker para limitar conexiones simultáneas al pool de Supabase. Otras copias de la aplicación también consumen conexiones del mismo pool.
+
+### Docker en una computadora o servidor sin Coolify
+
+Crear `.env` desde `.env.example`, completar valores y ejecutar desde la raíz:
+
+```powershell
+docker compose up -d --build
+```
+
+Para acceso local por `http://localhost:8080`, configurar `VITE_API_BASE_URL=http://localhost:8080`, incluir el origen local en `CORS_ALLOWED_ORIGINS` y la URL local de redirección si se usa. Estas variables son propias de esta instalación. Las pruebas con Vite continúan usando el proxy local al backend `127.0.0.1:8001`.
+
+Actualizar sin borrar los datos:
+
+```powershell
+docker compose up -d --build
+```
+
+Los contenedores se ejecutan en el servidor de Coolify; no necesitan Cloudflare Tunnel ni la computadora del desarrollador encendida.

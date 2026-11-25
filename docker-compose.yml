@@ -1,0 +1,47 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY}
+      DJANGO_DEBUG: ${DJANGO_DEBUG:-false}
+      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-conta.red.com.sv,localhost,127.0.0.1}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-https://conta.red.com.sv}
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_ISSUER: ${SUPABASE_ISSUER}
+      SUPABASE_JWKS_URL: ${SUPABASE_JWKS_URL}
+      SUPABASE_PUBLISHABLE_KEY: ${VITE_SUPABASE_PUBLISHABLE_KEY}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
+      SUPABASE_AUTH_REDIRECT_URL: ${SUPABASE_AUTH_REDIRECT_URL:-https://conta.red.com.sv/?establecer-clave=1}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_SSLMODE: ${POSTGRES_SSLMODE:-require}
+      IMPORT_PREVIEW_STORAGE_DIR: /var/lib/contared/private_storage/import_previews
+      DIRECT_RECONCILIATION_STORAGE_DIR: /var/lib/contared/private_storage/direct_reconciliation
+    volumes:
+      - contared_private_storage:/var/lib/contared/private_storage
+    expose:
+      - "8000"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        VITE_SUPABASE_URL: ${VITE_SUPABASE_URL}
+        VITE_SUPABASE_PUBLISHABLE_KEY: ${VITE_SUPABASE_PUBLISHABLE_KEY}
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-https://conta.red.com.sv}
+    depends_on:
+      backend:
+        condition: service_started
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
+    restart: unless-stopped
+
+volumes:
+  contared_private_storage:
