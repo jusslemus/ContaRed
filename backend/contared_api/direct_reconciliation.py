@@ -1274,62 +1274,7 @@ def _analyze_files(job_dir, country_code, period=None):
                 "mensaje": "No fue posible resolver inequívocamente el último corte anterior.",
             }]
 
-    claimed_cheque_banco = set()
-    for cut in result.get("cheques", []):
-        for record in cut.get("registros", []):
-            number = str(record.get("numero_documento") or "").strip()
-            cheque_amount = _parse_decimal(record.get("monto"))
-            candidates = []
-            if number and number != "0" and cheque_amount is not None:
-                for index, movement in enumerate(result["movimientos_banco"]):
-                    if index in claimed_cheque_banco:
-                        continue
-                    if str(movement.get("codigo_tt") or "").strip().upper() != "CQ":
-                        continue
-                    refs = {
-                        str(value).strip()
-                        for value in (
-                            movement.get("referencia"),
-                            movement.get("numero_transaccion"),
-                            movement.get("numero_cheque"),
-                        )
-                        if value not in (None, "")
-                    }
-                    original = movement.get("datos_originales", {})
-                    if isinstance(original, dict):
-                        for key, value in original.items():
-                            if str(key).casefold().startswith("referencia") and value not in (None, ""):
-                                refs.add(str(value).strip())
-                    bank_amount = _parse_decimal(movement.get("monto"))
-                    if number in refs and bank_amount is not None and bank_amount == cheque_amount:
-                        candidates.append((index, movement))
-            record["estado_al_corte"] = "pendiente_identificacion" if number in ("", "0") else "pendiente_cobro_o_identificacion"
-            record["cobro_identificado"] = []
-            if len(candidates) == 1:
-                index, movement = candidates[0]
-                claimed_cheque_banco.add(index)
-                evidence = {
-                    "archivo": movement.get("datos_originales", {}).get("archivo"),
-                    "hoja": movement.get("datos_originales", {}).get("hoja"),
-                    "fila": movement.get("fila_origen"),
-                    "valor_original": movement.get("datos_originales"),
-                }
-                record["estado_al_corte"] = "cobrado_identificado_en_banco"
-                record["cobro_identificado"] = [{
-                    "fecha": movement.get("fecha"),
-                    "tipo_movimiento": movement.get("codigo_tt"),
-                    "referencia": number,
-                    "referencias_banco": sorted({
-                        str(value).strip() for value in (
-                            movement.get("referencia"),
-                            movement.get("numero_transaccion"),
-                            movement.get("numero_cheque"),
-                        ) if value not in (None, "")
-                    }),
-                    "monto": movement.get("monto"),
-                    "movimiento_id": f"bank:{index}",
-                    "evidencia": evidence,
-                }]
+    _identify_historical_cheque_collections(result)
 
     _dashboard_sections(result)
     final_bank = None
@@ -1495,6 +1440,135 @@ def _same_day_group_candidates(bank_pending, books_pending, excluded_ids):
     ]
 
 
+def _cheque_identifier(value):
+    text = str(value or "").strip()
+    if re.fullmatch(r"[0-9]+(?:\.0+)?", text):
+        return text.split(".")[0].lstrip("0")
+    return ""
+
+
+def _identify_historical_cheque_collections(result):
+    """Match a full payment by cheque number AND amount, never by amount alone."""
+    current = (result.get("contexto_resultado") or {}).get("periodo") or (
+        ((result.get("banco") or {}).get("reconocimiento") or {}).get("contexto") or {}
+    ).get("periodo_declarado")
+    sources = [(f"bank:{index}", movement, None) for index, movement in enumerate(result.get("movimientos_banco", []))]
+    sources += [(item["id"], item["movimiento"], item.get("trabajo_id")) for item in result.get("cobros_bancarios_anteriores", [])]
+    claimed = set()
+    for cut in result.get("cheques", []):
+        for record in cut.get("registros", []):
+            number = _cheque_identifier(record.get("numero_documento"))
+            amount = _parse_decimal(record.get("monto"))
+            candidates = []
+            issue_date = None
+            for pattern in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+                try:
+                    issue_date = datetime.strptime(str(record.get("fecha") or "")[:10], pattern).strftime("%Y-%m-%d")
+                    break
+                except ValueError:
+                    pass
+            for movement_id, movement, source_job in sources:
+                if not number or amount is None or amount >= 0 or movement_id in claimed:
+                    continue
+                if str(movement.get("codigo_tt") or "").strip().upper() != "CQ":
+                    continue
+                if current and str(movement.get("fecha") or "")[:7] > current:
+                    continue
+                if issue_date and str(movement.get("fecha") or "")[:10] < issue_date:
+                    continue
+                values = [movement.get(key) for key in ("referencia", "numero_transaccion", "numero_cheque")]
+                values += list(_movement_references(movement))
+                references = {_cheque_identifier(value) for value in values}
+                if number in references and _parse_decimal(movement.get("monto")) == amount:
+                    candidates.append((movement_id, movement, source_job, sorted(references - {""})))
+            record["cobro_identificado"] = []
+            record["estado_al_corte"] = "pendiente_cobro_o_identificacion" if number else "pendiente_identificacion"
+            if len(candidates) != 1:
+                continue
+            movement_id, movement, source_job, matched_references = candidates[0]
+            claimed.add(movement_id)
+            original = movement.get("datos_originales") or {}
+            record["estado_al_corte"] = "cobrado_identificado_en_banco"
+            record["cobro_identificado"] = [{
+                "fecha": movement.get("fecha"), "tipo_movimiento": "CQ", "referencia": number,
+                "referencias_banco": matched_references,
+                "monto": movement.get("monto"), "movimiento_id": movement_id,
+                "trabajo_id": source_job,
+                "evidencia": {"archivo": original.get("archivo"), "hoja": original.get("hoja"),
+                              "fila": movement.get("fila_origen"), "valor_original": original},
+            }]
+
+
+def _reconciliation_adjustments(result):
+    groups = [
+        {"concepto": "Depósitos en circulación aplicados", "tipos": ("deposito_transito", "deposito_en_circulacion")},
+        {"concepto": "Cheques en circulación aplicados", "tipos": ("cheque_en_circulacion", "cheque_circulacion")},
+        {"concepto": "Depósitos mal operados y centavos aplicados", "tipos": ("deposito_mal_operado", "diferencia_por_centavos")},
+        {"concepto": "Otros movimientos verificados para el cuadre", "tipos": ()},
+    ]
+    for group in groups:
+        group.update(banco=Decimal("0.00"), contabilidad=Decimal("0.00"))
+    summary = result.get("resumen") or {}
+    for item in (summary.get("explicacion_diferencia") or {}).get("residual", {}).get("partidas_aplicadas", []):
+        if item.get("tipo") == "cheque_historico_cobrado":
+            continue
+        side = str(item.get("lado") or "").casefold()
+        effect = _parse_decimal(item.get("impacto_residual"))
+        if side not in ("banco", "contabilidad") or effect is None:
+            continue
+        group = next((group for group in groups if item.get("tipo") in group["tipos"]), groups[-1])
+        group[side] += effect if side == "banco" else -effect
+    explained = sum((group["contabilidad"] - group["banco"] for group in groups), Decimal("0.00"))
+    original = _parse_decimal(summary.get("diferencia_original"))
+    explanatory = []
+    if result.get("integracion_cheques") is not None and original is not None and original != explained:
+        unmatched = (result.get("proceso_conciliacion") or {}).get("movimientos_sin_contraparte") or {}
+        collected = {payment.get("movimiento_id") for cut in result.get("cheques", [])
+                     for record in cut.get("registros", []) for payment in record.get("cobro_identificado", [])}
+        book_cheques = set()
+        for movement in result.get("movimientos_libros", []):
+            raw = movement.get("datos_originales") or {}
+            number = _cheque_identifier(movement.get("numero_cheque") or raw.get("Referencia 2"))
+            amount = _parse_decimal(movement.get("monto"))
+            if number and amount is not None:
+                book_cheques.add((number, amount))
+        bank_only_checks = []
+        other_net = Decimal("0.00")
+        for side in ("banco", "contabilidad"):
+            for item in unmatched.get(side, []):
+                movement = item.get("movimiento") or {}
+                amount = _parse_decimal(movement.get("monto"))
+                if amount is None:
+                    continue
+                code = str(movement.get("codigo_tt") or "").upper()
+                if side == "banco" and code == "CQ":
+                    number = _cheque_identifier(movement.get("numero_cheque") or movement.get("referencia"))
+                    if item.get("movimiento_id") not in collected and number and (number, amount) not in book_cheques:
+                        bank_only_checks.append(item)
+                elif (side == "banco" and code != "CQ") or (side == "contabilidad" and code != "PP"):
+                    other_net += amount if side == "banco" else -amount
+        check_net = sum((_parse_decimal(item["movimiento"].get("monto")) for item in bank_only_checks), Decimal("0.00"))
+        # Include this comparison only when independently summed source rows
+        # reconcile exactly. Never manufacture the missing amount as an adjustment.
+        if bank_only_checks and (explained + check_net + other_net).quantize(Decimal("0.01")) == original.quantize(Decimal("0.01")):
+            for label, amount in (("Cheques cobrados sin contraparte en el mayor", check_net),
+                                  ("Otros movimientos pendientes netos", other_net)):
+                groups.append({"concepto": label, "tipos": (), "banco": Decimal("0.00"), "contabilidad": amount})
+            explanatory = [{"referencia": item["movimiento"].get("referencia"),
+                            "importe": item["movimiento"].get("monto"), "evidencia": item.get("evidencia")}
+                           for item in bank_only_checks]
+            explained += check_net + other_net
+    return {
+        "grupos": [{"concepto": group["concepto"], "banco": str(group["banco"].quantize(Decimal("0.01"))),
+                    "contabilidad": str(group["contabilidad"].quantize(Decimal("0.01")))} for group in groups],
+        "diferencia_explicada": str(explained.quantize(Decimal("0.01"))),
+        "importe_sin_explicar": str((original - explained).quantize(Decimal("0.01"))) if original is not None else None,
+        "coincide_con_diferencia_original": original is not None and original == explained,
+        "incluye_partidas_por_revisar": bool(explanatory),
+        "cheques_cobrados_sin_contraparte": explanatory,
+    }
+
+
 def _biq_cheques_en_circulacion(result):
     bank = (result.get("banco") or {}).get("reconocimiento", {}).get("contexto", {})
     books = (result.get("libros") or {}).get("reconocimiento", {}).get("contexto", {})
@@ -1507,8 +1581,7 @@ def _biq_cheques_en_circulacion(result):
         return None
 
     def identifier(value):
-        value = str(value or "").strip()
-        return value.lstrip("0") if value.isascii() and value.isdecimal() else ""
+        return _cheque_identifier(value)
 
     def payment(movement):
         source = movement.get("datos_originales") or {}
@@ -1539,7 +1612,7 @@ def _biq_cheques_en_circulacion(result):
             cancellations[movement_id] = (ref, number, payee, amount)
 
     bank_numbers = {
-        identifier(movement.get("numero_cheque") or movement.get("referencia"))
+        (identifier(movement.get("numero_cheque") or movement.get("referencia")), _parse_decimal(movement.get("monto")))
         for movement in result.get("movimientos_banco", [])
         if movement.get("codigo_tt") == "CQ"
     }
@@ -1601,7 +1674,7 @@ def _biq_cheques_en_circulacion(result):
     # reference. The reference of the cancelled cheque does not carry over.
     for movement_id, (ref, number, payee, amount) in issues.items():
         if number:
-            if number in bank_numbers or number in historical_numbers or numbered_issues[number] != 1:
+            if (number, -amount) in bank_numbers or number in historical_numbers or numbered_issues[number] != 1:
                 continue
             if any(cancel_ref == ref for cancel_ref, *_ in cancellations.values()):
                 continue
@@ -1619,7 +1692,7 @@ def _biq_cheques_en_circulacion(result):
         if len(records) != 1 or signed is None or signed >= 0:
             continue
         record = records[0]
-        if record.get("cobro_identificado") or (number and number in bank_numbers):
+        if record.get("cobro_identificado") or (number and (number, signed) in bank_numbers):
             continue
         if not number and (not payee or signed in unresolved_bank_amounts):
             continue
@@ -1729,6 +1802,11 @@ def _difference_explanation(result):
         for partida in summary.get("partidas_conciliatorias", [])
         if partida.get("tipo") == "cheque_historico_cobrado" and partida.get("verificado")
     }
+    identified_historical_bank_ids.update(
+        payment.get("movimiento_id")
+        for cut in result.get("cheques", []) for record in cut.get("registros", [])
+        for payment in record.get("cobro_identificado", [])
+    )
 
     def pending(side):
         total = Decimal("0")
@@ -1921,6 +1999,7 @@ def _difference_explanation(result):
         },
         "causa_determinada": bool(applied) and residual == 0,
     }
+    summary["cuadro_conciliacion"] = _reconciliation_adjustments(result)
 
 
 def _job_period(job):
@@ -1969,6 +2048,32 @@ def _historical_difference_evidence(result, scope, account, current_job_id=None)
             if str(saved_bank_context.get("moneda_codigo") or "").upper() != selected_currency:
                 continue
             related_jobs.append((saved_job, saved_result, _job_period(saved_job)))
+
+    # A stale consolidated list may still contain cheques already collected in
+    # an earlier statement. Keep the exact, scoped bank evidence at the cutoff.
+    result["cobros_bancarios_anteriores"] = []
+    seen_collections = set()
+    current_account = str((((result.get("banco") or {}).get("reconocimiento") or {}).get("contexto") or {}).get("cuenta_bancaria") or "")
+    for saved_job, saved_result, period in sorted(related_jobs, key=lambda entry: str(entry[0].get("actualizado_en") or ""), reverse=True):
+        saved_context = ((saved_result.get("banco") or {}).get("reconocimiento") or {}).get("contexto") or {}
+        if not period or period >= current_period or not current_account or str(saved_context.get("cuenta_bancaria") or "") != current_account:
+            continue
+        for movement in saved_result.get("movimientos_banco", []):
+            number = _cheque_identifier(movement.get("numero_cheque") or movement.get("referencia"))
+            amount = _parse_decimal(movement.get("monto"))
+            if movement.get("codigo_tt") != "CQ" or not number or amount is None or amount >= 0:
+                continue
+            source = movement.get("datos_originales") or {}
+            key = (str(movement.get("fecha")), number, str(amount), source.get("archivo"), source.get("hoja"), movement.get("fila_origen"))
+            if key in seen_collections:
+                continue
+            seen_collections.add(key)
+            result["cobros_bancarios_anteriores"].append({"id": f"prior:{saved_job['id']}:{movement.get('fila_origen')}", "trabajo_id": saved_job["id"], "movimiento": movement})
+    if result.get("movimientos_banco") is not None:
+        _identify_historical_cheque_collections(result)
+        _difference_explanation(result)
+        summary = result.get("resumen") or {}
+        explanation = summary.get("explicacion_diferencia") or {}
 
     previous_jobs = [
         saved_job for saved_job, _, period in related_jobs
@@ -2133,6 +2238,8 @@ def _job_response(job_dir, job):
         "empresa_id": job.get("empresa_id"),
         "contexto": normalized_context,
         "titulo": job.get("titulo"),
+        "nombre": job.get("nombre") or normalized_context.get("nombre_conciliacion") or "",
+        "originales_disponibles": (job_dir / "originales").exists() and any((job_dir / "originales").iterdir()),
         "version": job.get("version", 1),
         "version_de": job.get("version_de"),
         "sustituido_por": job.get("sustituido_por"),
@@ -2146,6 +2253,62 @@ def _job_response(job_dir, job):
         "creado_en": job["creado_en"],
         "actualizado_en": job["actualizado_en"],
     }
+
+
+def _database_saved_jobs(scope, account_id="", bank_id="", job_id=""):
+    query = """
+        SELECT id::text, empresa_id::text, pais_codigo, usuario_creador_id::text,
+               banco_id::text, cuenta_id::text, moneda_codigo,
+               to_char(periodo_sugerido, 'YYYY-MM'), estado, responsable_nombre,
+               version, progreso, resultado, creado_en, actualizado_en
+        FROM contared.trabajos_conciliacion_directa
+        WHERE empresa_id::text=%s AND pais_codigo=%s
+          AND estado IN ('finalizado','finalizado_con_pendientes','aprobado')
+    """
+    params = [str(scope["company_id"]), scope["country_code"]]
+    for column, value in (("cuenta_id", account_id), ("banco_id", bank_id), ("id", job_id)):
+        if value:
+            query += f" AND {column}::text=%s"
+            params.append(str(value))
+    query += " ORDER BY actualizado_en DESC, id DESC"
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+    except DatabaseError as exc:
+        raise DatabaseUnavailable() from exc
+    jobs = []
+    for row in rows:
+        result = row[12] or {}
+        if isinstance(result, str):
+            result = json.loads(result)
+        context = result.get("contexto_resultado") or {}
+        created = row[13].isoformat() if hasattr(row[13], "isoformat") else str(row[13] or "")
+        updated = row[14].isoformat() if hasattr(row[14], "isoformat") else str(row[14] or "")
+        jobs.append({
+            "id": row[0], "empresa_id": row[1], "pais_codigo": row[2], "usuario_creador_id": row[3],
+            "banco_id": row[4], "cuenta_id": row[5], "moneda_codigo": row[6], "periodo_sugerido": row[7],
+            "estado": row[8], "responsable_nombre": row[9], "version": row[10], "progreso": row[11] or [],
+            "resultado": result, "creado_en": created, "actualizado_en": updated, "finalizado_en": updated,
+            "archivos": [], "nombre": context.get("nombre_conciliacion") or "",
+            "titulo": context.get("nombre_conciliacion") or " · ".join(str(value) for value in (context.get("banco"), context.get("cuenta"), row[7]) if value),
+            "recuperado_de_base": True,
+        })
+    return jobs
+
+
+def _load_persisted_job(scope, job_id):
+    job_dir = _job_path(scope, job_id)
+    metadata = job_dir / "metadata.json"
+    if metadata.exists():
+        return job_dir, _read_json(metadata)
+    matches = _database_saved_jobs(scope, job_id=str(job_id))
+    if not matches:
+        raise NotFound("La conciliación no existe en el ámbito seleccionado.")
+    job = matches[0]
+    job_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(metadata, job)
+    return job_dir, job
 
 
 class DirectReconciliationListCreateView(APIView):
@@ -2176,6 +2339,11 @@ class DirectReconciliationListCreateView(APIView):
                     jobs.append(_job_response(metadata.parent, job))
                 except (json.JSONDecodeError, OSError):
                     continue
+        if request.query_params.get("historial") == "true":
+            local_ids = {str(item["id"]) for item in jobs}
+            for saved_job in _database_saved_jobs(scope, account_id=cuenta_id, bank_id=banco_id):
+                if str(saved_job["id"]) not in local_ids:
+                    jobs.append(_job_response(_job_path(scope, saved_job["id"]), saved_job))
         jobs.sort(key=lambda item: str(item.get("finalizado_en") or item.get("creado_en") or ""), reverse=True)
         return Response({"trabajos": jobs})
 
@@ -2300,8 +2468,7 @@ class DirectReconciliationListCreateView(APIView):
 class DirectReconciliationDetailView(APIView):
     def get(self, request, job_id):
         scope = _access(request)
-        job_dir = _job_path(scope, job_id)
-        job = _read_json(job_dir / "metadata.json")
+        job_dir, job = _load_persisted_job(scope, job_id)
         requested_account_id = request.query_params.get("cuenta_id")
         if requested_account_id and requested_account_id != job.get("cuenta_id"):
             raise ValidationError({"cuenta_id": "El trabajo no pertenece a la cuenta solicitada."})
@@ -2527,6 +2694,10 @@ class DirectReconciliationDetailView(APIView):
             return Response(_job_response(job_dir, job))
 
         if action == "finalizar":
+            name_value = request.data.get("nombre", "")
+            if not isinstance(name_value, str) or len(name_value.strip()) > 120:
+                raise ValidationError({"nombre": "El nombre debe ser texto de hasta 120 caracteres."})
+            name = " ".join(name_value.split())
             original_job = json.loads(json.dumps(job, ensure_ascii=False))
             account, suggestion = _validate_job_account(
                 scope,
@@ -2543,6 +2714,8 @@ class DirectReconciliationDetailView(APIView):
             job["vinculacion_cuenta"] = suggestion
             contexto["cuenta_operativa"] = str(account["numero"])
             contexto["moneda"] = account["moneda_codigo"]
+            contexto["nombre_conciliacion"] = name
+            job["nombre"] = name
             job.setdefault("resultado", {})["contexto_resultado"] = contexto
             resumen = job.get("resultado", {}).get("resumen", {})
             residual = resumen.get("diferencia_residual_pendiente")
@@ -2564,7 +2737,7 @@ class DirectReconciliationDetailView(APIView):
                     periodo_texto = periodo
             else:
                 periodo_texto = periodo
-            job["titulo"] = f"{banco} · {cuenta} · {periodo_texto}"
+            job["titulo"] = name or f"{banco} · {cuenta} · {periodo_texto}"
             periodo_db = job.get("periodo_sugerido")
             if isinstance(periodo_db, str) and len(periodo_db) == 7:
                 periodo_db = f"{periodo_db}-01"
@@ -2743,24 +2916,28 @@ class DirectReconciliationDetailView(APIView):
         scope = _access(request)
         if scope.get("role") != "administrador":
             raise PermissionDenied("Solo un administrador puede eliminar definitivamente un trabajo.")
-        job_dir = _job_path(scope, job_id)
-        if not job_dir.exists():
-            raise NotFound("El trabajo de conciliación no existe.")
-        shutil.rmtree(job_dir)
+        job_dir, job = _load_persisted_job(scope, job_id)
+        try:
+            with transaction.atomic():
+                with connection.cursor() as cursor:
+                    cursor.execute("DELETE FROM contared.trabajos_conciliacion_directa WHERE id::text=%s AND empresa_id::text=%s AND pais_codigo=%s", [str(job_id), str(scope["company_id"]), scope["country_code"]])
+                shutil.rmtree(job_dir)
+        except DatabaseError as exc:
+            raise DatabaseUnavailable() from exc
         return Response(status=204)
 
 
 class DirectReconciliationReportView(APIView):
     def get(self, request, job_id):
         scope = _access(request)
-        job_dir = _job_path(scope, job_id)
-        job = _read_json(job_dir / "metadata.json")
+        job_dir, job = _load_persisted_job(scope, job_id)
         requested_account_id = request.query_params.get("cuenta_id")
         if requested_account_id and requested_account_id != job.get("cuenta_id"):
             raise ValidationError({"cuenta_id": "El informe no pertenece a la cuenta solicitada."})
         result = job.get("resultado", {})
         if result.get("resumen") and result.get("proceso_conciliacion"):
             _difference_explanation(result)
+            _historical_difference_evidence(result, scope, job.get("cuenta_seleccionada") or {"id": job.get("cuenta_id"), "moneda_codigo": job.get("moneda_codigo")}, current_job_id=job_id)
         report_format = request.query_params.get("formato", "xlsx")
         if report_format == "xlsx":
             output = self._xlsx(scope, job, result)
@@ -2888,9 +3065,9 @@ class DirectReconciliationReportView(APIView):
         for label, amount in (
             ("Saldo final Banco", bank_balance),
             ("Saldo final Contabilidad", book_balance),
-            ("Diferencia residual", residual),
+            ("Diferencia original", _parse_decimal(summary.get("diferencia_original"))),
         ):
-            highlight = label == "Diferencia residual" and amount not in (None, 0)
+            highlight = label == "Diferencia original" and amount not in (None, 0)
             amount_style = ParagraphStyle("ConciliacionResidualAmount", parent=card_amount, textColor=red) if highlight else card_amount
             card = Table([[[Paragraph(label, card_label), Spacer(1, 4), Paragraph(money(amount), amount_style)]]], colWidths=[card_width])
             card.setStyle(TableStyle([
@@ -2909,40 +3086,42 @@ class DirectReconciliationReportView(APIView):
         ]))
         story.extend([cifras, Spacer(1, 15)])
 
-        item_types = {}
-        for item in summary.get("partidas_conciliatorias", []):
-            item_id = item.get("movimiento_id") or item.get("id")
-            if item_id is not None:
-                item_types[item_id] = item.get("tipo")
-
-        deposits = {"banco": Decimal("0.00"), "contabilidad": Decimal("0.00")}
-        checks = deposits.copy()
-        others = deposits.copy()
-        groups = {
-            "deposito_transito": deposits,
-            "deposito_en_circulacion": deposits,
-            "cheque_en_circulacion": checks,
-            "cheque_circulacion": checks,
-        }
+        shared = _reconciliation_adjustments(result)
+        shared_groups = shared["grupos"]
+        deposits, checks, corrections, others = [
+            {side: Decimal(group[side]) for side in ("banco", "contabilidad")} for group in shared_groups[:4]
+        ]
+        for group in shared_groups[4:]:
+            others["banco"] += Decimal(group["banco"])
+            others["contabilidad"] += Decimal(group["contabilidad"])
+        if shared.get("incluye_partidas_por_revisar"):
+            residual = _parse_decimal(shared.get("importe_sin_explicar"))
         effects_available = True
-        has_other_items = False
-        for item in applied_items:
-            effect = _parse_decimal(item.get("impacto_residual"))
-            side = str(item.get("lado") or "").strip().casefold()
-            if effect is None or side not in deposits:
-                effects_available = False
-                continue
-            group = groups.get(item_types.get(item.get("id")), others)
-            has_other_items |= group is others
-            # The residual is Banco minus Contabilidad.
-            group[side] += effect if side == "banco" else -effect
+        has_other_items = any(others.values())
+        def display_text(value):
+            text = str(value)
+            for _ in range(2):
+                if not any(marker in text for marker in ("Ã", "Â")):
+                    break
+                for encoding in ("cp1252", "latin1"):
+                    try:
+                        repaired = text.encode(encoding).decode("utf-8")
+                    except (UnicodeEncodeError, UnicodeDecodeError):
+                        continue
+                    text = repaired
+                    break
+                else:
+                    break
+            return text
+        def adjustment(value):
+            return f"({'-' if value < 0 else '+'}) {money(abs(value))}"
 
         balanced_values = effects_available and all(value is not None for value in (bank_balance, book_balance, residual))
         if balanced_values:
             bank_subtotal = bank_balance + deposits["banco"]
             book_subtotal = book_balance + deposits["contabilidad"]
-            adjusted_bank = bank_subtotal + checks["banco"] + others["banco"]
-            adjusted_books = book_subtotal + checks["contabilidad"] + others["contabilidad"]
+            adjusted_bank = bank_subtotal + checks["banco"] + corrections["banco"] + others["banco"]
+            adjusted_books = book_subtotal + checks["contabilidad"] + corrections["contabilidad"] + others["contabilidad"]
             balanced_values = (adjusted_bank - adjusted_books).quantize(Decimal("0.01")) == residual
 
         rows = [
@@ -2951,23 +3130,31 @@ class DirectReconciliationReportView(APIView):
         ]
         if balanced_values:
             rows.extend([
-                ["Depósitos en circulación", money(deposits["contabilidad"]), money(deposits["banco"]), Paragraph(
+                ["Depósitos en circulación", adjustment(deposits["contabilidad"]), adjustment(deposits["banco"]), Paragraph(
                     "Importes aplicados por lado." if any(deposits.values()) else "Sin depósitos aplicados.", small,
                 )],
                 ["Subtotal", money(book_subtotal), money(bank_subtotal), Paragraph("Saldos después de los depósitos aplicados.", small)],
-                ["Cheques en circulación", money(checks["contabilidad"]), money(checks["banco"]), Paragraph(
+                ["Cheques en circulación", adjustment(checks["contabilidad"]), adjustment(checks["banco"]), Paragraph(
                     "Cheques pendientes de cobro verificados." if any(checks.values()) else "Sin partidas de cheques aplicadas.", small,
                 )],
             ])
-            if has_other_items:
-                rows.append(["Otras partidas aplicadas", money(others["contabilidad"]), money(others["banco"]), Paragraph("Otras partidas verificadas aplicadas al saldo.", small)])
-            balance_label = "Saldo conciliado" if residual == 0 else "Saldo ajustado"
+            rows.append(["Depósitos mal operados y centavos", adjustment(corrections["contabilidad"]), adjustment(corrections["banco"]), Paragraph("Importes verificados aplicados por lado.", small)])
+            if shared.get("incluye_partidas_por_revisar"):
+                for group in shared_groups[4:]:
+                    rows.append([group["concepto"], adjustment(Decimal(group["contabilidad"])), adjustment(Decimal(group["banco"])), Paragraph("Partida pendiente de revisión; sin asiento registrado.", small)])
+            elif has_other_items:
+                rows.append(["Otras partidas aplicadas", adjustment(others["contabilidad"]), adjustment(others["banco"]), Paragraph("Otras partidas verificadas aplicadas al saldo.", small)])
+            balance_label = "Saldos comparados" if shared.get("incluye_partidas_por_revisar") else "Saldo conciliado" if residual == 0 else "Saldo ajustado"
             rows.append([balance_label, money(adjusted_books), money(adjusted_bank), Paragraph(
-                "Los saldos ajustados coinciden." if residual == 0 else "Queda una diferencia por conciliar.", small,
+                "Comparación con partidas por revisar." if shared.get("incluye_partidas_por_revisar") else "Los saldos ajustados coinciden." if residual == 0 else "Queda una diferencia por conciliar.", small,
             )])
         else:
             rows.append(["Saldos ajustados", "—", "—", Paragraph("El resultado guardado no permite desglosar el ajuste por lado.", small)])
-        rows.append(["Diferencia residual", "", money(residual), Paragraph("Banco menos Contabilidad.", small)])
+        rows.append(["Total de partidas", "", money(shared["diferencia_explicada"]), Paragraph("Suma neta de los ajustes.", small)])
+        rows.append(["Diferencia pendiente", "", money(shared["importe_sin_explicar"]), Paragraph("Diferencia original menos ajustes.", small)])
+        rows.append(["Diferencia original entre Banco y Contabilidad", "", money(summary.get("diferencia_original")), Paragraph("Banco menos Contabilidad.", small)])
+        header_small = ParagraphStyle("SummaryTableHeader", parent=small, textColor=colors.white)
+        rows = [[Paragraph(str(row[0]), header_small if index == 0 else small), *row[1:]] for index, row in enumerate(rows)]
 
         balance_table = Table(rows, colWidths=[1.82*inch, 1.15*inch, 1.15*inch, 3.18*inch])
         balance_table.setStyle(TableStyle([
@@ -2996,7 +3183,21 @@ class DirectReconciliationReportView(APIView):
             ("FONTSIZE", (0, 2), (-1, 2), 8),
             ("TEXTCOLOR", (0, 2), (-1, 2), muted),
         ]))
-        story.append(KeepTogether([Paragraph("Cuadro de conciliación", heading), Spacer(1, 6), balance_table, signatures]))
+        story.extend([Paragraph("Cuadro de conciliación", heading), Spacer(1, 6), balance_table, Spacer(1, 8), signatures])
+        integration = result.get("integracion_cheques") or []
+        if integration:
+            rows = [["Cheque / referencia", "Importe", "Archivo, hoja y fila de origen"]]
+            for item in integration:
+                sources = [row.get("evidencia") or {} for row in item.get("filas", [])]
+                source_text = "; ".join(f"{source.get('archivo') or 'Archivo no disponible'} / {source.get('hoja') or '-'} / fila {source.get('fila') or '-'}" for source in sources)
+                rows.append([Paragraph(str(item.get("numero") or item.get("referencia") or "Sin número"), small),
+                             money(item.get("importe")), Paragraph(escape(display_text(source_text)), small)])
+            rows.append([Paragraph("Total cheques pendientes", small), money(sum((Decimal(item["importe"]) for item in integration), Decimal("0.00"))), ""])
+            cheque_table = Table(rows, colWidths=[1.6*inch, 1.2*inch, 4.5*inch], repeatRows=1)
+            cheque_table.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,0), red), ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+                ("GRID", (0,0), (-1,-1), .3, border), ("VALIGN", (0,0), (-1,-1), "TOP"),
+                ("TOPPADDING", (0,0), (-1,-1), 6), ("BOTTOMPADDING", (0,0), (-1,-1), 6)]))
+            story.extend([PageBreak(), Paragraph("Cheques pendientes de cobro al cierre", heading), Spacer(1, 6), cheque_table])
 
         doc = SimpleDocTemplate(output, pagesize=letter, leftMargin=0.45*inch, rightMargin=0.45*inch,
                                 topMargin=0.4*inch, bottomMargin=0.45*inch, title="Resumen de conciliación")
@@ -3530,8 +3731,7 @@ class DirectReconciliationReportView(APIView):
 class DirectReconciliationSourceView(APIView):
     def get(self, request, job_id, filename):
         scope = _access(request)
-        job_dir = _job_path(scope, job_id)
-        job = _read_json(job_dir / "metadata.json")
+        job_dir, job = _load_persisted_job(scope, job_id)
         requested_account_id = request.query_params.get("cuenta_id")
         if requested_account_id and requested_account_id != job.get("cuenta_id"):
             raise ValidationError({"cuenta_id": "El archivo no pertenece a la cuenta solicitada."})

@@ -1271,7 +1271,7 @@ class DirectReconciliationHistoryTests(SimpleTestCase):
     def history(self, **filters):
         request = APIRequestFactory().get("/", {"historial": "true", **filters})
         force_authenticate(request, user=self.user)
-        with patch("contared_api.direct_reconciliation._access", return_value=self.scope), patch("contared_api.direct_reconciliation._scope_jobs_path", return_value=self.root):
+        with patch("contared_api.direct_reconciliation._access", return_value=self.scope), patch("contared_api.direct_reconciliation._scope_jobs_path", return_value=self.root), patch("contared_api.direct_reconciliation._database_saved_jobs", return_value=[]):
             return DirectReconciliationListCreateView.as_view()(request)
 
     def test_history_keeps_saved_versions_and_orders_by_date(self):
@@ -1292,7 +1292,7 @@ class DirectReconciliationHistoryTests(SimpleTestCase):
         statements = []
         for job_id in ("first", "second"):
             folder = self.write_job(job_id, estado="preparado")
-            request = APIRequestFactory().post("/", {"accion": "finalizar", "cuenta_id": "account"}, format="json")
+            request = APIRequestFactory().post("/", {"accion": "finalizar", "cuenta_id": "account", "nombre": "Prueba " + job_id}, format="json")
             force_authenticate(request, user=self.user)
             with patch(f"{module}._writer_access", return_value=self.scope), patch(f"{module}._job_path", return_value=folder), patch(f"{module}._validate_job_account", return_value=(self.account, None)), patch(f"{module}.transaction.atomic"), patch(f"{module}.connection") as database:
                 response = DirectReconciliationDetailView.as_view()(request, job_id=job_id)
@@ -1300,8 +1300,73 @@ class DirectReconciliationHistoryTests(SimpleTestCase):
                 statements.extend(database.cursor.return_value.__enter__.return_value.execute.call_args_list)
         self.assertEqual({item["id"] for item in self.history(cuenta_id="account").data["trabajos"]}, {"first", "second"})
         self.assertEqual([call.args[1][0] for call in statements], ["first", "second"])
+        self.assertEqual([self.json.loads(call.args[1][-1])["contexto_resultado"]["nombre_conciliacion"] for call in statements], ["Prueba first", "Prueba second"])
         self.assertTrue(all("ON CONFLICT (id)" in call.args[0] for call in statements))
 
+
+
+    def test_overlong_name_is_rejected_without_changing_saved_job(self):
+        folder = self.write_job("draft", estado="preparado")
+        request = APIRequestFactory().post("/", {"accion": "finalizar", "nombre": "x" * 121}, format="json")
+        force_authenticate(request, user=self.user)
+        with patch("contared_api.direct_reconciliation._writer_access", return_value=self.scope), patch("contared_api.direct_reconciliation._job_path", return_value=folder):
+            response = DirectReconciliationDetailView.as_view()(request, job_id="draft")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.json.loads((folder / "metadata.json").read_text())["estado"], "preparado")
+
+    def test_history_merges_database_results_without_duplicate_ids(self):
+        folder = self.write_job("local")
+        local = self.json.loads((folder / "metadata.json").read_text())
+        remote = {**local, "id": "remote", "nombre": "Cierre de agosto", "titulo": "Cierre de agosto"}
+        request = APIRequestFactory().get("/", {"historial": "true", "cuenta_id": "account"})
+        force_authenticate(request, user=self.user)
+        with patch("contared_api.direct_reconciliation._access", return_value=self.scope), patch("contared_api.direct_reconciliation._scope_jobs_path", return_value=self.root), patch("contared_api.direct_reconciliation._database_saved_jobs", return_value=[local, remote]) as backup:
+            response = DirectReconciliationListCreateView.as_view()(request)
+        self.assertEqual({job["id"] for job in response.data["trabajos"]}, {"local", "remote"})
+        backup.assert_called_once_with(self.scope, account_id="account", bank_id="")
+        recovered = next(job for job in response.data["trabajos"] if job["id"] == "remote")
+        self.assertEqual(recovered["nombre"], "Cierre de agosto")
+        self.assertFalse(recovered["originales_disponibles"])
+
+    def test_database_query_preserves_scope_and_name(self):
+        from contared_api.direct_reconciliation import _database_saved_jobs
+        result = {"contexto_resultado": {"nombre_conciliacion": "Agosto revisado"}}
+        row = ("remote", "company", "GT", "user", "bank", "account", "GTQ", "2026-08", "finalizado", "Ana", 2, [], result, "2026-08-31", "2026-09-01")
+        with patch("contared_api.direct_reconciliation.connection") as database:
+            cursor = database.cursor.return_value.__enter__.return_value
+            cursor.fetchall.return_value = [row]
+            jobs = _database_saved_jobs(self.scope, account_id="account", job_id="remote")
+        sql, params = cursor.execute.call_args.args
+        self.assertIn("empresa_id::text=%s AND pais_codigo=%s", sql)
+        self.assertEqual(params, ["company", "GT", "account", "remote"])
+        self.assertEqual(jobs[0]["nombre"], "Agosto revisado")
+
+    def test_opening_database_only_result_restores_metadata_without_fake_originals(self):
+        from contared_api.direct_reconciliation import _load_persisted_job, _job_response
+        folder = self.root / "user" / "remote"
+        job = {"id": "remote", "empresa_id": "company", "pais_codigo": "GT", "cuenta_id": "account", "estado": "finalizado", "progreso": [], "archivos": [], "creado_en": "2026-08-31", "actualizado_en": "2026-08-31", "resultado": {"contexto_resultado": {"nombre_conciliacion": "Agosto revisado"}}}
+        with patch("contared_api.direct_reconciliation._job_path", return_value=folder), patch("contared_api.direct_reconciliation._database_saved_jobs", return_value=[job]) as backup:
+            recovered_dir, recovered = _load_persisted_job(self.scope, "remote")
+            _load_persisted_job(self.scope, "remote")
+        backup.assert_called_once_with(self.scope, job_id="remote")
+        self.assertTrue((folder / "metadata.json").exists())
+        response = _job_response(recovered_dir, recovered)
+        self.assertEqual(response["nombre"], "Agosto revisado")
+        self.assertFalse(response["originales_disponibles"])
+
+
+    def test_delete_removes_only_selected_database_job_and_local_snapshot(self):
+        folder = self.write_job("delete-me")
+        job = self.json.loads((folder / "metadata.json").read_text())
+        request = APIRequestFactory().delete("/")
+        force_authenticate(request, user=self.user)
+        with patch("contared_api.direct_reconciliation._access", return_value=self.scope), patch("contared_api.direct_reconciliation._load_persisted_job", return_value=(folder, job)), patch("contared_api.direct_reconciliation.transaction.atomic"), patch("contared_api.direct_reconciliation.connection") as database:
+            response = DirectReconciliationDetailView.as_view()(request, job_id="delete-me")
+        self.assertEqual(response.status_code, 204)
+        sql, params = database.cursor.return_value.__enter__.return_value.execute.call_args.args
+        self.assertIn("empresa_id::text=%s AND pais_codigo=%s", sql)
+        self.assertEqual(params, ["delete-me", "company", "GT"])
+        self.assertFalse(folder.exists())
 
 class DirectOutstandingChequeTests(SimpleTestCase):
     def test_prior_consolidated_cheques_collected_in_month_are_not_in_final_integration(self):
@@ -1321,3 +1386,117 @@ class DirectOutstandingChequeTests(SimpleTestCase):
                 integration = _biq_cheques_en_circulacion(result)
                 self.assertEqual([item["numero"] for item in integration], ["1002"])
                 self.assertEqual(sum(Decimal(item["importe"]) for item in integration), Decimal("75.00"))
+
+class DirectChequeCollectionRegressionTests(SimpleTestCase):
+    def result(self):
+        result = DirectDifferenceExplanationTests()._result("75.00")
+        result["contexto_resultado"] = {"periodo": "2026-09"}
+        result["banco"]["reconocimiento"]["contexto"].update({"pais_codigo": "GT", "cuenta_bancaria": "0040040592", "moneda_codigo": "GTQ", "periodo_declarado": "2026-09"})
+        result["libros"]["reconocimiento"]["contexto"].update({"codigo_contable": "1101030103", "moneda_codigo": "GTQ", "periodo_declarado": "2026-09"})
+        result["cheques"] = [{"periodo_corte": "2026-08", "registros": [{"numero_documento": "001001.0", "fecha": "01/07/2026", "monto": "-50.00", "archivo": "corte.xlsx", "hoja": "Cheques", "fila": 2}, {"numero_documento": "1002", "monto": "-75.00", "archivo": "corte.xlsx", "hoja": "Cheques", "fila": 3}]}]
+        result["movimientos_banco"] = [{"codigo_tt": "CQ", "fecha": "2026-09-02", "referencia": "1001", "monto": "-50.00", "fila_origen": 5, "datos_originales": {"archivo": "banco.xlsx", "hoja": "Estado"}}]
+        return result
+
+    def test_number_format_is_normalized_and_collected_cheque_is_not_applied(self):
+        from contared_api.direct_reconciliation import _identify_historical_cheque_collections
+        result = self.result()
+        _identify_historical_cheque_collections(result)
+        _difference_explanation(result)
+        self.assertEqual([item["numero"] for item in result["integracion_cheques"]], ["1002"])
+        self.assertEqual(result["resumen"]["cuadro_conciliacion"]["diferencia_explicada"], "75.00")
+        self.assertEqual(result["resumen"]["cuadro_conciliacion"]["importe_sin_explicar"], "0.00")
+
+    def test_same_amount_different_cheques_are_kept_distinct(self):
+        from contared_api.direct_reconciliation import _identify_historical_cheque_collections
+        result = self.result()
+        result["cheques"][0]["registros"] = [{"numero_documento": "13700", "monto": "-23456.25"}]
+        result["movimientos_banco"][0].update(referencia="13702", monto="-23456.25")
+        _identify_historical_cheque_collections(result)
+        _difference_explanation(result)
+        self.assertFalse(result["cheques"][0]["registros"][0]["cobro_identificado"])
+        self.assertEqual(result["integracion_cheques"][0]["numero"], "13700")
+        self.assertFalse(result["resumen"]["cuadro_conciliacion"]["coincide_con_diferencia_original"])
+
+    def test_matching_number_requires_matching_amount_and_no_future_payment(self):
+        from contared_api.direct_reconciliation import _identify_historical_cheque_collections
+        for update in ({"monto": "-49.99"}, {"fecha": "2026-10-01"}):
+            with self.subTest(update=update):
+                result = self.result()
+                result["movimientos_banco"][0].update(update)
+                _identify_historical_cheque_collections(result)
+                self.assertFalse(result["cheques"][0]["registros"][0]["cobro_identificado"])
+
+    def test_prior_month_evidence_removes_stale_cheque_for_same_account_only(self):
+        import json
+        from contared_api.direct_reconciliation import _historical_difference_evidence
+        result = self.result()
+        prior_movement = result["movimientos_banco"].pop()
+        prior_movement["fecha"] = "2026-08-02"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "user" / "previous"
+            path.mkdir(parents=True)
+            previous = {"id": "previous", "empresa_id": "company", "pais_codigo": "GT", "cuenta_id": "account", "moneda_codigo": "GTQ", "estado": "finalizado", "periodo_sugerido": "2026-08", "resultado": {"banco": {"reconocimiento": {"contexto": {"cuenta_bancaria": "0040040592", "moneda_codigo": "GTQ"}}}, "movimientos_banco": [prior_movement]}}
+            (path / "metadata.json").write_text(json.dumps(previous), encoding="utf-8")
+            with patch("contared_api.direct_reconciliation._scope_jobs_path", return_value=root):
+                _difference_explanation(result)
+                _historical_difference_evidence(result, {"company_id": "company", "country_code": "GT"}, {"id": "account", "moneda_codigo": "GTQ"})
+            self.assertEqual([item["numero"] for item in result["integracion_cheques"]], ["1002"])
+            self.assertEqual(result["cheques"][0]["registros"][0]["cobro_identificado"][0]["trabajo_id"], "previous")
+            # Another account must never inherit that payment evidence.
+            with patch("contared_api.direct_reconciliation._scope_jobs_path", return_value=root):
+                _historical_difference_evidence(result, {"company_id": "company", "country_code": "GT"}, {"id": "different", "moneda_codigo": "GTQ"})
+            self.assertEqual(len(result["integracion_cheques"]), 2)
+
+    def test_shared_table_excludes_collected_cheque_and_groups_centavos(self):
+        from contared_api.direct_reconciliation import _reconciliation_adjustments
+        result = self.result()
+        result["resumen"]["explicacion_diferencia"] = {"residual": {"partidas_aplicadas": [
+            {"tipo": "cheque_historico_cobrado", "lado": "Banco", "impacto_residual": "-50.00"},
+            {"tipo": "cheque_en_circulacion", "lado": "Contabilidad", "impacto_residual": "-74.99"},
+            {"tipo": "diferencia_por_centavos", "lado": "Contabilidad", "impacto_residual": "-0.01"},
+        ]}}
+        table = _reconciliation_adjustments(result)
+        self.assertEqual(table["grupos"][1]["contabilidad"], "74.99")
+        self.assertEqual(table["grupos"][2]["contabilidad"], "0.01")
+        self.assertEqual(table["diferencia_explicada"], "75.00")
+        self.assertTrue(table["coincide_con_diferencia_original"])
+
+    def test_bank_only_collected_cheque_explains_gap_without_becoming_approved_adjustment(self):
+        from contared_api.direct_reconciliation import _identify_historical_cheque_collections
+        result = self.result()
+        result["cheques"][0]["registros"][1]["monto"] = "-100.00"
+        movement = {"codigo_tt": "CQ", "fecha": "2026-09-05", "referencia": "13702", "monto": "-25.00"}
+        result["movimientos_banco"].append(movement)
+        result["proceso_conciliacion"]["movimientos_sin_contraparte"]["banco"] = [{"movimiento_id": "bank:1", "movimiento": movement}]
+        _identify_historical_cheque_collections(result)
+        _difference_explanation(result)
+        table = result["resumen"]["cuadro_conciliacion"]
+        self.assertTrue(table["incluye_partidas_por_revisar"])
+        self.assertEqual(table["diferencia_explicada"], "75.00")
+        self.assertEqual(table["importe_sin_explicar"], "0.00")
+        self.assertEqual(result["resumen"]["diferencia_residual_pendiente"], "-25.00")
+        self.assertFalse(result["resumen"]["explicacion_diferencia"]["causa_determinada"])
+        self.assertEqual([item["numero"] for item in result["integracion_cheques"]], ["1002"])
+
+    def test_pdf_uses_same_total_as_detail_and_only_lists_outstanding_cheques(self):
+        from io import BytesIO
+        from reportlab.platypus import Table as RealTable
+        from contared_api.direct_reconciliation import DirectReconciliationReportView, _identify_historical_cheque_collections
+        result = self.result()
+        _identify_historical_cheque_collections(result)
+        _difference_explanation(result)
+        tables = []
+        def table(data, *args, **kwargs):
+            tables.append([[cell.getPlainText() if hasattr(cell, "getPlainText") else cell for cell in row] for row in data])
+            return RealTable(data, *args, **kwargs)
+        output = BytesIO()
+        with patch("contared_api.direct_reconciliation.Table", side_effect=table):
+            DirectReconciliationReportView()._pdf_summary(output, {"company_id": "company", "country_code": "GT"}, {"pais_codigo": "GT", "periodo_sugerido": "2026-09", "estado": "preparado"}, result)
+        self.assertTrue(output.getvalue().startswith(b"%PDF"))
+        labels = lambda row: row[0].getPlainText() if hasattr(row[0], "getPlainText") else str(row[0])
+        check_row = next(row for data in tables for row in data if labels(row) == "Cheques en circulación")
+        self.assertEqual(check_row[1:3], ["(+) Q75.00", "(+) Q0.00"])
+        total = next(row for data in tables for row in data if labels(row) == "Total cheques pendientes")
+        self.assertEqual(total[1], "Q75.00")
+        self.assertFalse(any(labels(row) == "1001" for data in tables for row in data))

@@ -218,7 +218,7 @@ function classifyDetail(result: RowData, countryCode: Props["countryCode"]) {
   const integration = result.integracion_cheques as RowData[] | undefined;
   const integratedIds = new Set((integration ?? []).map((item) => item.filas[0].id).filter(Boolean));
   const checkKey = (number: unknown, amount: unknown) => {
-    const key = String(number ?? "").trim().replace(/^0+/, "");
+    const key = String(number ?? "").trim().replace(/\.0+$/, "").replace(/^0+/, "");
     return key && amount != null && Number.isFinite(Number(amount)) ? `${key}:${Math.abs(Number(amount))}` : "";
   };
 
@@ -382,8 +382,18 @@ function ReconciliationDetail({ result, currency, countryCode, context, initialT
     if (String(item.lado).toLowerCase() === "banco") adjustment.banco += Math.round(effect * 100);
     if (String(item.lado).toLowerCase() === "contabilidad") adjustment.contabilidad -= Math.round(effect * 100);
   }
+  const sharedGroups = summary.cuadro_conciliacion?.grupos;
+  if (Array.isArray(sharedGroups) && sharedGroups.length >= adjustments.length) {
+    sharedGroups.forEach((group: RowData, index: number) => {
+      const value = { label: String(group.concepto), types: [] as string[], banco: Math.round(Number(group.banco) * 100), contabilidad: Math.round(Number(group.contabilidad) * 100) };
+      if (index < adjustments.length) adjustments[index] = value;
+      else adjustments.push(value);
+    });
+  }
   const amounts = adjustments.reduce((total, item) => ({ banco: total.banco + item.banco, contabilidad: total.contabilidad + item.contabilidad }), { banco: 0, contabilidad: 0 });
-  const explained = applied;
+  const explainedCents = amounts.contabilidad - amounts.banco;
+  const unexplainedCents = Math.round(Number(summary.diferencia_original) * 100) - explainedCents;
+  const explained = applied.filter((item: RowData) => item.tipo !== "cheque_historico_cobrado");
   const pendingChecks = checks.filter((entry) => entry.kind === "Cheque en circulación");
   const formatAdjustment = (cents: number) =>
     `${cents < 0 ? "(-)" : "(+)"} ${formatMoney(Math.abs(cents) / 100, currency)}`;
@@ -446,7 +456,9 @@ function ReconciliationDetail({ result, currency, countryCode, context, initialT
                 <td className="money">{formatAdjustment(item.banco)}</td>
               </tr>;
             })}
-            <tr><th scope="row">Saldos ajustados</th><td className="money">{formatMoney(adjusted(summary.saldo_final_contabilidad, amounts.contabilidad), currency)}</td><td className="money">{formatMoney(adjusted(summary.saldo_final_banco, amounts.banco), currency)}</td></tr>
+            <tr><th scope="row">{summary.cuadro_conciliacion?.incluye_partidas_por_revisar ? "Saldos comparados" : "Saldos ajustados"}</th><td className="money">{formatMoney(adjusted(summary.saldo_final_contabilidad, amounts.contabilidad), currency)}</td><td className="money">{formatMoney(adjusted(summary.saldo_final_banco, amounts.banco), currency)}</td></tr>
+            <tr><th scope="row" colSpan={2}>Total de partidas</th><td className="money">{formatMoney(explainedCents / 100, currency)}</td></tr>
+            <tr><th scope="row" colSpan={2}>Diferencia pendiente</th><td className="money">{formatMoney(unexplainedCents / 100, currency)}</td></tr>
             <tr><th scope="row" colSpan={2}>Diferencia original entre Banco y Contabilidad</th><td className="money"><strong>{formatMoney(summary.diferencia_original, currency)}</strong></td></tr>
           </tbody>
         </table></div>
