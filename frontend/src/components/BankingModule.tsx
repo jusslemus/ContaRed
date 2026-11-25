@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import type { Session } from "@supabase/supabase-js";
 
-const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "");
+const apiBaseUrl = import.meta.env.DEV ? window.location.origin : (import.meta.env.VITE_API_BASE_URL as string | undefined ?? "").replace(/\/$/, "");
 type Bank = { id: string; nombre: string; activo: boolean };
 type Account = { id: string; banco: string; banco_id?: string | null; alias: string; numero: string; numero_completo?: string | null; numero_terminacion?: string | null; terminacion?: string | null; moneda_codigo: string; codigo_contable?: string | null; activa: boolean; banco_activo: boolean; pendiente_configuracion?: boolean };
 function accountListNumber(account: Account, countryCode: "SV" | "GT") {

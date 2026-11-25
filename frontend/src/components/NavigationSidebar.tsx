@@ -16,6 +16,7 @@ export default function NavigationSidebar({ active, userName, role, isAdministra
   const items: { label: Section; available: boolean }[] = [
     { label: "Cuentas", available: true },
     { label: "Nueva conciliación", available: true },
+    { label: "Historial", available: true },
     { label: "Administración de usuarios", available: isAdministrator },
   ];
   return (

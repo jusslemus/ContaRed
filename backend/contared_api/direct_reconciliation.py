@@ -2134,6 +2134,8 @@ def _job_response(job_dir, job):
         "contexto": normalized_context,
         "titulo": job.get("titulo"),
         "version": job.get("version", 1),
+        "version_de": job.get("version_de"),
+        "sustituido_por": job.get("sustituido_por"),
         "finalizado_en": job.get("finalizado_en"),
         "responsable": job.get("responsable"),
         "responsable_nombre": job.get("responsable_nombre"),
@@ -2171,11 +2173,10 @@ class DirectReconciliationListCreateView(APIView):
                     if request.query_params.get("historial") == "true":
                         if job.get("estado") not in ("finalizado_con_pendientes", "finalizado", "aprobado"):
                             continue
-                        if job.get("sustituido_por"):
-                            continue
                     jobs.append(_job_response(metadata.parent, job))
                 except (json.JSONDecodeError, OSError):
                     continue
+        jobs.sort(key=lambda item: str(item.get("finalizado_en") or item.get("creado_en") or ""), reverse=True)
         return Response({"trabajos": jobs})
 
     def post(self, request):

@@ -1247,3 +1247,77 @@ class DirectDifferenceExplanationTests(SimpleTestCase):
             "Origen pendiente de revisar en el cierre anterior",
         )
         self.assertEqual(response.data["resultado"]["resumen"]["diferencia_residual_pendiente"], "25.00")
+
+class DirectReconciliationHistoryTests(SimpleTestCase):
+    def setUp(self):
+        import json
+        self.json = json
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.user_id = uuid4()
+        self.user = SupabaseUser(self.user_id)
+        self.scope = {"user_id": str(self.user_id), "company_id": "company", "country_code": "GT", "role": "administrador", "user_name": "Contabilidad"}
+        self.account = {"id": "account", "banco_id": "bank", "numero": "0040040592", "moneda_codigo": "GTQ"}
+
+    def write_job(self, job_id, **overrides):
+        job = {"id": job_id, "empresa_id": "company", "pais_codigo": "GT", "cuenta_id": "account", "banco_id": "bank", "estado": "finalizado", "version": 1, "periodo_sugerido": "2026-10", "progreso": [], "archivos": [], "creado_en": "2026-10-31T00:00:00Z", "actualizado_en": "2026-10-31T00:00:00Z", "resultado": {"resumen": {"diferencia_residual_pendiente": "0.00"}}}
+        job.update(overrides)
+        folder = self.root / "user" / job_id
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "metadata.json").write_text(self.json.dumps(job), encoding="utf-8")
+        return folder
+
+    def history(self, **filters):
+        request = APIRequestFactory().get("/", {"historial": "true", **filters})
+        force_authenticate(request, user=self.user)
+        with patch("contared_api.direct_reconciliation._access", return_value=self.scope), patch("contared_api.direct_reconciliation._scope_jobs_path", return_value=self.root):
+            return DirectReconciliationListCreateView.as_view()(request)
+
+    def test_history_keeps_saved_versions_and_orders_by_date(self):
+        self.write_job("older", sustituido_por="newer", finalizado_en="2026-11-01T00:00:00Z")
+        self.write_job("newer", version=2, version_de="older", finalizado_en="2026-11-02T00:00:00Z")
+        self.write_job("draft", estado="preparado")
+        self.write_job("foreign", empresa_id="other-company")
+        self.write_job("other-account", cuenta_id="other-account")
+        response = self.history(cuenta_id="account")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([item["id"] for item in response.data["trabajos"]], ["newer", "older"])
+        self.assertEqual(response.data["trabajos"][1]["sustituido_por"], "newer")
+        self.assertEqual(response.data["trabajos"][0]["version_de"], "older")
+        self.assertEqual(len(self.history().data["trabajos"]), 3)
+
+    def test_saving_twice_keeps_two_reconciliations_for_same_account_and_month(self):
+        module = "contared_api.direct_reconciliation"
+        statements = []
+        for job_id in ("first", "second"):
+            folder = self.write_job(job_id, estado="preparado")
+            request = APIRequestFactory().post("/", {"accion": "finalizar", "cuenta_id": "account"}, format="json")
+            force_authenticate(request, user=self.user)
+            with patch(f"{module}._writer_access", return_value=self.scope), patch(f"{module}._job_path", return_value=folder), patch(f"{module}._validate_job_account", return_value=(self.account, None)), patch(f"{module}.transaction.atomic"), patch(f"{module}.connection") as database:
+                response = DirectReconciliationDetailView.as_view()(request, job_id=job_id)
+                self.assertEqual(response.status_code, 200)
+                statements.extend(database.cursor.return_value.__enter__.return_value.execute.call_args_list)
+        self.assertEqual({item["id"] for item in self.history(cuenta_id="account").data["trabajos"]}, {"first", "second"})
+        self.assertEqual([call.args[1][0] for call in statements], ["first", "second"])
+        self.assertTrue(all("ON CONFLICT (id)" in call.args[0] for call in statements))
+
+
+class DirectOutstandingChequeTests(SimpleTestCase):
+    def test_prior_consolidated_cheques_collected_in_month_are_not_in_final_integration(self):
+        from contared_api.direct_reconciliation import _biq_cheques_en_circulacion
+        for month, previous in (("2026-10", "2026-09"), ("2026-11", "2026-10")):
+            with self.subTest(month=month):
+                result = {
+                    "banco": {"reconocimiento": {"contexto": {"pais_codigo": "GT", "cuenta_bancaria": "0040040592", "periodo_declarado": month}}},
+                    "libros": {"reconocimiento": {"contexto": {"codigo_contable": "1101030103", "periodo_declarado": month}}},
+                    "proceso_conciliacion": {"movimientos_sin_contraparte": {"banco": [], "contabilidad": []}},
+                    "movimientos_banco": [{"codigo_tt": "CQ", "numero_cheque": "1001", "monto": "-50.00", "fecha": month + "-05"}],
+                    "cheques": [{"periodo_corte": previous, "registros": [
+                        {"numero_documento": "1001", "monto": "-50.00", "cobro_identificado": [{"movimiento_id": "paid"}]},
+                        {"numero_documento": "1002", "monto": "-75.00", "archivo": "consolidado.xlsx", "hoja": "Cheques", "fila": 3},
+                    ]}],
+                }
+                integration = _biq_cheques_en_circulacion(result)
+                self.assertEqual([item["numero"] for item in integration], ["1002"])
+                self.assertEqual(sum(Decimal(item["importe"]) for item in integration), Decimal("75.00"))

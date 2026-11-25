@@ -17,6 +17,7 @@ type Props = {
   onBackToAccount?: () => void;
   onBackToBank?: () => void;
   onSavedAccount?: (accountId: string) => void;
+  onNewReconciliation?: (accountId: string) => void;
 };
 
 type DocumentFile = { name: string; size: number; lastModified: number };
@@ -120,6 +121,8 @@ export default function DirectReconciliationModule(props: Props) {
   const [documentFiles, setDocumentFiles] = useState<File[]>([]);
   const [historyJobs, setHistoryJobs] = useState<Record<string, unknown>[]>([]);
   const [activeJobId, setActiveJobId] = useState("");
+  const [activeJobSaved, setActiveJobSaved] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const [activeJobAccountId, setActiveJobAccountId] = useState("");
   const [apiError, setApiError] = useState("");
   const [activeResult, setActiveResult] = useState<Record<string, any> | null>(null);
@@ -152,7 +155,7 @@ export default function DirectReconciliationModule(props: Props) {
   const closureReplacementName = useRef<string | undefined>(undefined);
   const replacingIndex = useRef<number | null>(null);
   const storageKey = `contared-direct-${props.session.user.id}-${props.companyId}-${props.countryCode}`;
-  const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "");
+  const apiBaseUrl = import.meta.env.DEV ? window.location.origin : (import.meta.env.VITE_API_BASE_URL as string | undefined ?? "").replace(/\/$/, "");
   const authHeaders = { Authorization: `Bearer ${props.session.access_token}` };
 
   useEffect(() => {
@@ -196,6 +199,8 @@ export default function DirectReconciliationModule(props: Props) {
 
   useEffect(() => {
     if (!apiBaseUrl || props.mode !== "history") return;
+    setHistoryLoading(true);
+    setApiError("");
     const params = new URLSearchParams({ empresa_id: props.companyId, pais_codigo: props.countryCode, historial: "true" });
     if (props.cuentaId) params.set("cuenta_id", props.cuentaId);
     if (props.bancoId) params.set("banco_id", props.bancoId);
@@ -205,7 +210,8 @@ export default function DirectReconciliationModule(props: Props) {
         const payload = await response.json() as { trabajos: Record<string, unknown>[] };
         setHistoryJobs(payload.trabajos ?? []);
       })
-      .catch((error: unknown) => setApiError(error instanceof Error ? error.message : "No se pudo cargar el historial."));
+      .catch((error: unknown) => setApiError(error instanceof Error ? error.message : "No se pudo cargar el historial."))
+      .finally(() => setHistoryLoading(false));
   }, [apiBaseUrl, props.mode, props.companyId, props.countryCode, props.session.access_token, props.cuentaId, props.bancoId]);
 
   useEffect(() => {
@@ -288,6 +294,7 @@ export default function DirectReconciliationModule(props: Props) {
     if (!response.ok) throw new Error(await responseError(response, `No se pudo recuperar el trabajo (HTTP ${response.status}).`));
     const job = await response.json() as { id: string; cuenta_id?: string; cuenta_seleccionada?: AccountOption; vinculacion_cuenta?: AccountLinkSuggestion | null; resultado?: Record<string, any>; estado: string };
     setActiveJobId(job.id);
+    setActiveJobSaved(["finalizado", "finalizado_con_pendientes", "aprobado"].includes(job.estado));
     setActiveJobAccountId(job.cuenta_id ?? "");
     if (job.cuenta_seleccionada) setSelectedAccount(job.cuenta_seleccionada);
     setAccountLinkSuggestion(job.vinculacion_cuenta ?? null);
@@ -366,6 +373,7 @@ export default function DirectReconciliationModule(props: Props) {
     if (activeJobId && activeJobAccountId !== account.id) {
       if (!window.confirm("El resultado analizado no se reasignará. Para usar esta cuenta debes iniciar un análisis nuevo con los documentos actuales. ¿Continuar?")) return;
       setActiveJobId("");
+      setActiveJobSaved(false);
       setActiveJobAccountId("");
       setActiveResult(null);
       setAccountLinkSuggestion(null);
@@ -422,6 +430,7 @@ export default function DirectReconciliationModule(props: Props) {
         resultado?: Record<string, any>;
       };
       setActiveJobId(job.id);
+    setActiveJobSaved(["finalizado", "finalizado_con_pendientes", "aprobado"].includes(job.estado));
       setActiveJobAccountId(job.cuenta_id);
       if (job.cuenta_seleccionada) setSelectedAccount(job.cuenta_seleccionada);
       setAccountLinkSuggestion(job.vinculacion_cuenta ?? null);
@@ -541,6 +550,7 @@ export default function DirectReconciliationModule(props: Props) {
       setDocuments([]);
       setActiveResult(null);
       setActiveJobId("");
+      setActiveJobSaved(false);
       setActiveJobAccountId("");
       setStage("idle");
       localStorage.removeItem(storageKey);
@@ -555,7 +565,7 @@ export default function DirectReconciliationModule(props: Props) {
 
   async function recalculateJob(jobId = activeJobId, accountId = activeJobAccountId, replacementFiles?: File[], replacementName?: string) {
     if (!jobId || !apiBaseUrl) return;
-    if (!window.confirm("Se sustituirá el resultado visible solo cuando termine el recálculo. El resultado anterior se conservará si ocurre un fallo.")) return;
+    if (!window.confirm("Se creará una nueva versión. La conciliación guardada se conservará en el historial; guardá la nueva versión al terminar.")) return;
     setApiError("");
     setStage("analyzing");
     try {
@@ -577,6 +587,7 @@ export default function DirectReconciliationModule(props: Props) {
       if (!response.ok) throw new Error(await responseError(response, `No se pudo recalcular (HTTP ${response.status}).`));
       const job = await response.json() as { id: string; cuenta_id?: string; cuenta_seleccionada?: AccountOption; vinculacion_cuenta?: AccountLinkSuggestion | null; resultado?: Record<string, any>; estado: string };
       setActiveJobId(job.id);
+    setActiveJobSaved(["finalizado", "finalizado_con_pendientes", "aprobado"].includes(job.estado));
       setActiveJobAccountId(job.cuenta_id ?? accountId);
       if (job.cuenta_seleccionada) setSelectedAccount(job.cuenta_seleccionada);
       setAccountLinkSuggestion(job.vinculacion_cuenta ?? null);
@@ -707,6 +718,7 @@ export default function DirectReconciliationModule(props: Props) {
         setDocumentFiles([]);
         setDocuments([]);
         setActiveJobId("");
+      setActiveJobSaved(false);
         setActiveResult(null);
         setStage("idle");
         localStorage.removeItem(storageKey);
@@ -720,7 +732,7 @@ export default function DirectReconciliationModule(props: Props) {
 
   if (props.mode === "history") {
     return <section className="direct-module">
-      <header><p className="eyebrow">CONCILIACIONES</p><h1>Conciliaciones de la cuenta o banco</h1>{props.cuentaId && <button type="button" className="quiet-button" onClick={props.onBackToAccount}>Volver a la cuenta</button>}{props.bancoId && <button type="button" className="quiet-button" onClick={props.onBackToBank}>Volver al banco</button>}</header>
+      <header><p className="eyebrow">CONCILIACIONES</p><h1>{props.cuentaId ? "Historial de la cuenta" : props.bancoId ? "Historial del banco" : "Historial de conciliaciones"}</h1>{props.cuentaId && <button type="button" className="primary-button" onClick={() => props.onNewReconciliation?.(props.cuentaId!)}>Nueva conciliación para esta cuenta</button>}{props.cuentaId && <button type="button" className="quiet-button" onClick={props.onBackToAccount}>Volver a la cuenta</button>}{props.bancoId && <button type="button" className="quiet-button" onClick={props.onBackToBank}>Volver al banco</button>}</header>
       {apiError && <div className="notice error" role="alert"><span>{apiError}</span><button type="button" className="quiet-button" onClick={() => window.location.reload()}>Reintentar</button></div>}
       <input ref={closureReplaceInput} hidden type="file" accept=".xlsx,.xls" onChange={(event) => {
         const file = event.target.files?.[0];
@@ -732,7 +744,9 @@ export default function DirectReconciliationModule(props: Props) {
         job={historyJobs.find((item) => String(item.id) === activeJobId)}
         companyName={props.companyName}
         countryCode={props.countryCode}
-        saved={true}
+        saved={activeJobSaved}
+        saving={saving}
+        onSave={() => void saveToHistory()}
         onBackToHistory={returnFromPreviousReconciliation}
         onBackLabel={dashboardReturnState ? "Volver a la conciliación" : undefined}
         onDownloadExcel={downloadWorkbook}
@@ -748,7 +762,9 @@ export default function DirectReconciliationModule(props: Props) {
         onReadSourceRow={readSourceRow}
       />}
       <div className="direct-card">
-        {!historyJobs.length ? <p>No hay trabajos registrados en el servidor para este usuario, empresa y país.</p> : <ul className="document-list">
+        <h2>Conciliaciones guardadas ({historyJobs.length})</h2>
+        <p>Podés guardar varias conciliaciones de la misma cuenta y período. Las versiones anteriores se conservan.</p>
+        {historyLoading ? <p role="status">Cargando historial…</p> : !historyJobs.length ? <p>No hay conciliaciones guardadas para los filtros seleccionados.</p> : <ul className="document-list">
           {historyJobs.map((job) => <li key={String(job.id)}>
             {(() => {
               const context = (job.contexto as Record<string, unknown> | undefined) ?? {};
@@ -760,10 +776,10 @@ export default function DirectReconciliationModule(props: Props) {
                 ? job.responsable_nombre
                 : "Responsable no disponible";
               const date = formatJobDate(job.finalizado_en ?? job.actualizado_en);
-              return <span className="history-job-identification"><strong>{bank} · {account}</strong><small>{period}</small><small>{formatStateLabel(job.estado)} · {responsible} · {date}</small></span>;
+              return <span className="history-job-identification"><strong>{bank} · {account}</strong><small>{period} · Versión {String(job.version ?? 1)} · Registro {String(job.id).slice(0, 8)}</small><small>{formatStateLabel(job.estado)} · {responsible} · {date}</small></span>;
             })()}
             <span className="document-actions">
-              <button type="button" className="secondary-button" onClick={() => void loadJob(String(job.id), String(job.cuenta_id ?? "")).catch((error: unknown) => setApiError(error instanceof Error ? error.message : "No se pudo abrir el trabajo."))}>Abrir dashboard</button>
+              <button type="button" className="secondary-button" onClick={() => void loadJob(String(job.id), String(job.cuenta_id ?? "")).catch((error: unknown) => setApiError(error instanceof Error ? error.message : "No se pudo abrir el trabajo."))}>Ver conciliación</button>
               <button type="button" className="quiet-button" onClick={() => void recalculateJob(String(job.id), String(job.cuenta_id ?? ""))}>Recalcular</button>
               <button type="button" className="danger-button" onClick={() => void discardOrDeleteJob(String(job.id), true)}>Eliminar</button>
             </span>

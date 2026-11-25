@@ -45,7 +45,7 @@ type Props = {
 };
 type DraftAccess = { enabled: boolean; rol: Role; exists: boolean };
 
-const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "");
+const apiBaseUrl = import.meta.env.DEV ? window.location.origin : (import.meta.env.VITE_API_BASE_URL as string | undefined ?? "").replace(/\/$/, "");
 const ROLE_DETAILS: { id: Role; label: string; description: string }[] = [
   { id: "administrador", label: "Administrador", description: "Administra usuarios, bancos, cuentas y conciliaciones dentro de sus empresas y países autorizados." },
   { id: "auxiliar", label: "Auxiliar de contabilidad", description: "Carga documentos, realiza análisis, recalcula y guarda conciliaciones; consulta y descarga reportes." },
