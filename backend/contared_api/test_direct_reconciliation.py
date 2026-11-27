@@ -1462,7 +1462,7 @@ class DirectChequeCollectionRegressionTests(SimpleTestCase):
         self.assertEqual(table["diferencia_explicada"], "75.00")
         self.assertTrue(table["coincide_con_diferencia_original"])
 
-    def test_bank_only_collected_cheque_explains_gap_without_becoming_approved_adjustment(self):
+    def test_bank_only_collected_cheque_is_not_used_to_force_the_summary(self):
         from contared_api.direct_reconciliation import _identify_historical_cheque_collections
         result = self.result()
         result["cheques"][0]["registros"][1]["monto"] = "-100.00"
@@ -1472,12 +1472,41 @@ class DirectChequeCollectionRegressionTests(SimpleTestCase):
         _identify_historical_cheque_collections(result)
         _difference_explanation(result)
         table = result["resumen"]["cuadro_conciliacion"]
-        self.assertTrue(table["incluye_partidas_por_revisar"])
-        self.assertEqual(table["diferencia_explicada"], "75.00")
-        self.assertEqual(table["importe_sin_explicar"], "0.00")
+        self.assertFalse(table["incluye_partidas_por_revisar"])
+        self.assertEqual(table["diferencia_explicada"], "100.00")
+        self.assertEqual(table["importe_sin_explicar"], "-25.00")
         self.assertEqual(result["resumen"]["diferencia_residual_pendiente"], "-25.00")
         self.assertFalse(result["resumen"]["explicacion_diferencia"]["causa_determinada"])
         self.assertEqual([item["numero"] for item in result["integracion_cheques"]], ["1002"])
+
+    def test_review_exclusion_is_scoped_and_does_not_mark_a_cheque_paid(self):
+        from copy import deepcopy
+        from contared_api.direct_reconciliation import _identify_historical_cheque_collections
+        base = self.result()
+        base["movimientos_banco"] = []
+        review = {"periodo": "2026-09", "cuenta": "0040040592", "numero": "1001", "importe": "50.00", "archivo": "corte.xlsx", "hoja": "Cheques", "fila": 2, "resolucion": "excluir_del_listado", "motivo": "Revision indicada por Contabilidad"}
+        for change, expected in (({}, ["1002"]), ({"periodo": "2026-08"}, ["1001", "1002"]), ({"cuenta": "otra"}, ["1001", "1002"]), ({"fila": 9}, ["1001", "1002"]), ({"archivo": "otro.xlsx"}, ["1001", "1002"])):
+            with self.subTest(change=change):
+                result = deepcopy(base)
+                result["revisiones_cheques"] = [dict(review, **change)]
+                _identify_historical_cheque_collections(result)
+                _difference_explanation(result)
+                self.assertEqual([item["numero"] for item in result["integracion_cheques"]], expected)
+                self.assertFalse(result["cheques"][0]["registros"][0]["cobro_identificado"])
+
+    def test_reviewed_exclusion_keeps_independent_non_cheque_difference_visible(self):
+        from contared_api.direct_reconciliation import _identify_historical_cheque_collections
+        result = self.result()
+        result["movimientos_banco"] = []
+        result["revisiones_cheques"] = [{"periodo": "2026-09", "cuenta": "0040040592", "numero": "1001", "importe": "50.00", "archivo": "corte.xlsx", "hoja": "Cheques", "fila": 2, "resolucion": "excluir_del_listado", "motivo": "Revision de Contabilidad"}]
+        result["proceso_conciliacion"]["movimientos_sin_contraparte"] = {"banco": [{"movimiento": {"codigo_tt": "DE", "monto": "10.00"}}], "contabilidad": [{"movimiento": {"codigo_tt": "DP", "monto": "10.01"}}]}
+        _identify_historical_cheque_collections(result)
+        _difference_explanation(result)
+        table = result["resumen"]["cuadro_conciliacion"]
+        self.assertEqual(table["grupos"][1]["contabilidad"], "75.00")
+        self.assertEqual(table["grupos"][2]["contabilidad"], "-0.01")
+        self.assertEqual(table["importe_sin_explicar"], "0.01")
+        self.assertFalse(table["coincide_con_diferencia_original"])
 
     def test_pdf_uses_same_total_as_detail_and_only_lists_outstanding_cheques(self):
         from io import BytesIO

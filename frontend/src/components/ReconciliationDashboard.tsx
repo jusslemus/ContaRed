@@ -176,7 +176,7 @@ function processPendingRows(process: RowData, difference: RowData, side: Process
       if (row) row.status = "Cheque cobrado";
     }
   }
-  return Array.from(rows, ([id, row]) => ({ id, ...row }));
+  return Array.from(rows, ([id, row]) => ({ id, ...row })).filter((row) => row.status !== "Cheque cobrado" && !(side === "banco" && String(row.movement.codigo_tt ?? "").toUpperCase() === "CQ"));
 }
 
 function ProcessStatus({ status }: { status: ProcessStatusLabel }) {
@@ -228,7 +228,7 @@ function classifyDetail(result: RowData, countryCode: Props["countryCode"]) {
       const kind = collected ? "Cheque cobrado" : "Cheque en circulación";
       const key = checkKey(record.numero_documento, record.monto);
       if (key) checkKeys.add(key);
-      if (integration && !collected) continue;
+      if (collected || record.exclusion_revision || integration) continue;
       const historical = detailRow("Corte histórico", {
         movimiento: { ...record, referencia: record.numero_cero ? "Sin número" : record.numero_documento },
         evidencia: { archivo: record.archivo ?? cut.nombre, hoja: record.hoja, fila: record.fila },
@@ -265,10 +265,11 @@ function classifyDetail(result: RowData, countryCode: Props["countryCode"]) {
     ];
     const rejected = rows.some((row) => isRejectedCheck(row, countryCode));
     const collected = !rejected && Number(rows[0].movement.monto) < 0 && rows.some((row) => isCheck(row.movement, countryCode));
-    const kind = rejected ? "Cheque rechazado" : collected ? "Cheque cobrado" : "Conciliado";
+    if (collected) continue;
+    const kind = rejected ? "Cheque rechazado" : "Conciliado";
     const entry = { kind, status: rejected ? "Cruce confirmado · revisar devolución" : "Cruce confirmado", rows, note: match.criterio };
     cases.push(entry);
-    if (collected) checks.push(entry);
+
   }
 
   for (const group of difference.pendientes?.contabilidad?.reversiones_identificadas ?? []) {
@@ -317,6 +318,7 @@ function classifyDetail(result: RowData, countryCode: Props["countryCode"]) {
       const check = amount < 0 && isCheck(movement, countryCode);
       const deposit = side === "contabilidad" && isDeposit(movement);
       const kind = rejected ? "Cheque rechazado" : check ? side === "banco" ? "Cheque cobrado" : "Cheque en circulación" : deposit ? "Depósito en circulación" : "Sin contraparte";
+      if (kind === "Cheque cobrado") continue;
       const entry = { kind, status: "Por verificar", rows: [row], note: item.estado_al_cierre ?? item.situacion };
       cases.push(entry);
       if (deposit) deposits.push(entry);

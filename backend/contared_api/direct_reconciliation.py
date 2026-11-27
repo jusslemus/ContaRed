@@ -1499,6 +1499,26 @@ def _identify_historical_cheque_collections(result):
             }]
 
 
+def _apply_reviewed_cheque_exclusions(result):
+    context = ((result.get("banco") or {}).get("reconocimiento") or {}).get("contexto") or {}
+    period = (result.get("contexto_resultado") or {}).get("periodo") or context.get("periodo_declarado")
+    account = str(context.get("cuenta_bancaria") or "")
+    reviews = [review for review in result.get("revisiones_cheques", [])
+               if review.get("periodo") == period and str(review.get("cuenta")) == account
+               and review.get("resolucion") == "excluir_del_listado" and review.get("motivo")]
+    for cut in result.get("cheques", []):
+        for record in cut.get("registros", []):
+            record.pop("exclusion_revision", None)
+            for review in reviews:
+                if (_cheque_identifier(record.get("numero_documento")) == _cheque_identifier(review.get("numero"))
+                    and _parse_decimal(record.get("monto")) == -abs(_parse_decimal(review.get("importe")) or Decimal("0"))
+                    and str(record.get("archivo")) == str(review.get("archivo"))
+                    and str(record.get("hoja")) == str(review.get("hoja"))
+                    and str(record.get("fila")) == str(review.get("fila"))):
+                    record["exclusion_revision"] = review
+                    break
+
+
 def _reconciliation_adjustments(result):
     groups = [
         {"concepto": "Depósitos en circulación aplicados", "tipos": ("deposito_transito", "deposito_en_circulacion")},
@@ -1520,52 +1540,30 @@ def _reconciliation_adjustments(result):
         group[side] += effect if side == "banco" else -effect
     explained = sum((group["contabilidad"] - group["banco"] for group in groups), Decimal("0.00"))
     original = _parse_decimal(summary.get("diferencia_original"))
-    explanatory = []
-    if result.get("integracion_cheques") is not None and original is not None and original != explained:
+    pending_deposit_comparison = False
+    excluded = [record for cut in result.get("cheques", []) for record in cut.get("registros", []) if record.get("exclusion_revision")]
+    if excluded and not any(group["banco"] or group["contabilidad"] for group in (groups[0], groups[2], groups[3])):
         unmatched = (result.get("proceso_conciliacion") or {}).get("movimientos_sin_contraparte") or {}
-        collected = {payment.get("movimiento_id") for cut in result.get("cheques", [])
-                     for record in cut.get("registros", []) for payment in record.get("cobro_identificado", [])}
-        book_cheques = set()
-        for movement in result.get("movimientos_libros", []):
-            raw = movement.get("datos_originales") or {}
-            number = _cheque_identifier(movement.get("numero_cheque") or raw.get("Referencia 2"))
-            amount = _parse_decimal(movement.get("monto"))
-            if number and amount is not None:
-                book_cheques.add((number, amount))
-        bank_only_checks = []
-        other_net = Decimal("0.00")
+        deposit_net = Decimal("0.00")
         for side in ("banco", "contabilidad"):
             for item in unmatched.get(side, []):
                 movement = item.get("movimiento") or {}
                 amount = _parse_decimal(movement.get("monto"))
-                if amount is None:
-                    continue
                 code = str(movement.get("codigo_tt") or "").upper()
-                if side == "banco" and code == "CQ":
-                    number = _cheque_identifier(movement.get("numero_cheque") or movement.get("referencia"))
-                    if item.get("movimiento_id") not in collected and number and (number, amount) not in book_cheques:
-                        bank_only_checks.append(item)
-                elif (side == "banco" and code != "CQ") or (side == "contabilidad" and code != "PP"):
-                    other_net += amount if side == "banco" else -amount
-        check_net = sum((_parse_decimal(item["movimiento"].get("monto")) for item in bank_only_checks), Decimal("0.00"))
-        # Include this comparison only when independently summed source rows
-        # reconcile exactly. Never manufacture the missing amount as an adjustment.
-        if bank_only_checks and (explained + check_net + other_net).quantize(Decimal("0.01")) == original.quantize(Decimal("0.01")):
-            for label, amount in (("Cheques cobrados sin contraparte en el mayor", check_net),
-                                  ("Otros movimientos pendientes netos", other_net)):
-                groups.append({"concepto": label, "tipos": (), "banco": Decimal("0.00"), "contabilidad": amount})
-            explanatory = [{"referencia": item["movimiento"].get("referencia"),
-                            "importe": item["movimiento"].get("monto"), "evidencia": item.get("evidencia")}
-                           for item in bank_only_checks]
-            explained += check_net + other_net
+                if amount is not None and ((side == "banco" and code != "CQ") or (side == "contabilidad" and code != "PP")):
+                    deposit_net += amount if side == "banco" else -amount
+        if deposit_net:
+            groups[2]["contabilidad"] += deposit_net
+            groups[2]["concepto"] = "Diferencias por depósitos y centavos por revisar"
+            explained += deposit_net
+            pending_deposit_comparison = True
     return {
         "grupos": [{"concepto": group["concepto"], "banco": str(group["banco"].quantize(Decimal("0.01"))),
                     "contabilidad": str(group["contabilidad"].quantize(Decimal("0.01")))} for group in groups],
         "diferencia_explicada": str(explained.quantize(Decimal("0.01"))),
         "importe_sin_explicar": str((original - explained).quantize(Decimal("0.01"))) if original is not None else None,
         "coincide_con_diferencia_original": original is not None and original == explained,
-        "incluye_partidas_por_revisar": bool(explanatory),
-        "cheques_cobrados_sin_contraparte": explanatory,
+        "incluye_partidas_por_revisar": pending_deposit_comparison,
     }
 
 
@@ -1620,7 +1618,7 @@ def _biq_cheques_en_circulacion(result):
     latest = max((cut["periodo_corte"] for cut in cuts), default=None)
     historical = [
         record for cut in cuts if cut["periodo_corte"] == latest
-        for record in cut.get("registros", [])
+        for record in cut.get("registros", []) if not record.get("exclusion_revision")
     ]
     used_bank_ids = {
         cobro.get("movimiento_id") for record in historical for cobro in record.get("cobro_identificado", [])
@@ -1748,6 +1746,7 @@ def _difference_explanation(result):
     explanatory = []
     applied = []
     applied_effect = Decimal("0.00")
+    _apply_reviewed_cheque_exclusions(result)
     integration = _biq_cheques_en_circulacion(result)
     if integration is not None:
         result["integracion_cheques"] = integration
@@ -2025,6 +2024,13 @@ def _historical_difference_evidence(result, scope, account, current_job_id=None)
     selected_account_id = str(account.get("id") or "")
     selected_currency = str(account.get("moneda_codigo") or "").upper()
     history_root = _scope_jobs_path(scope)
+    review_path = history_root / "revisiones_cheques.json"
+    if review_path.exists():
+        review_document = _read_json(review_path)
+        result["revisiones_cheques"] = [review for review in review_document.get("revisiones", [])
+            if str(review.get("empresa_id")) == str(scope["company_id"])
+            and review.get("pais_codigo") == scope["country_code"]
+            and review.get("periodo") == current_period]
     related_jobs = []
     if history_root.exists():
         for metadata_path in history_root.glob("*/*/metadata.json"):
@@ -3138,7 +3144,7 @@ class DirectReconciliationReportView(APIView):
                     "Cheques pendientes de cobro verificados." if any(checks.values()) else "Sin partidas de cheques aplicadas.", small,
                 )],
             ])
-            rows.append(["Depósitos mal operados y centavos", adjustment(corrections["contabilidad"]), adjustment(corrections["banco"]), Paragraph("Importes verificados aplicados por lado.", small)])
+            rows.append(["Depósitos mal operados y centavos", adjustment(corrections["contabilidad"]), adjustment(corrections["banco"]), Paragraph("Diferencia neta de movimientos por revisar; sin asiento registrado." if shared.get("incluye_partidas_por_revisar") else "Importes verificados aplicados por lado.", small)])
             if shared.get("incluye_partidas_por_revisar"):
                 for group in shared_groups[4:]:
                     rows.append([group["concepto"], adjustment(Decimal(group["contabilidad"])), adjustment(Decimal(group["banco"])), Paragraph("Partida pendiente de revisión; sin asiento registrado.", small)])
@@ -3574,6 +3580,8 @@ class DirectReconciliationReportView(APIView):
         for cut in result.get("cheques", []) if integration is None else []:
             for record in cut.get("registros", []):
                 cobro = record.get("cobro_identificado", [])
+                if cobro or record.get("exclusion_revision"):
+                    continue
                 cobro_text = ""
                 evidence_text = ""
                 if cobro:
@@ -3699,6 +3707,8 @@ class DirectReconciliationReportView(APIView):
         for cut in result.get("cheques", []):
             for record in cut["registros"]:
                 cobro = record.get("cobro_identificado", [])
+                if cobro or record.get("exclusion_revision"):
+                    continue
                 cobro_text = ""
                 evidence_text = ""
                 if cobro:
